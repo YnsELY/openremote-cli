@@ -9,6 +9,18 @@ import { buildShellCommand, getShellLaunch, resolveExecutable } from "./shell.js
 function ts() {
     return `[${new Date().toISOString()}] [qwen-runner]`;
 }
+function sanitizePtyEnv(extra = {}) {
+    const env = {};
+    for (const [key, value] of Object.entries(process.env)) {
+        if (typeof value === "string") {
+            env[key] = value;
+        }
+    }
+    for (const [key, value] of Object.entries(extra)) {
+        env[key] = value;
+    }
+    return env;
+}
 export class QwenRunner extends EventEmitter {
     provider = "qwen";
     sessions = new Map();
@@ -290,6 +302,7 @@ export class QwenRunner extends EventEmitter {
         const resolvedQwen = isWin ? null : resolveExecutable("qwen");
         if (!existsSync(entry.projectPath)) {
             const detail = `Failed to launch Qwen PTY because the working directory does not exist: ${entry.projectPath}`;
+            entry.status = "failed";
             this.writeTrace(entry, "launch-error", {
                 shell: null,
                 shellArgs: null,
@@ -316,6 +329,7 @@ export class QwenRunner extends EventEmitter {
         const shellArgs = isWin ? ["/c", "qwen", ...args] : unixShell.argsForCommand(unixCommand);
         if (!isWin && !resolvedQwen) {
             const detail = "Failed to launch Qwen PTY because the qwen binary could not be resolved from the login shell PATH.";
+            entry.status = "failed";
             this.writeTrace(entry, "launch-error", {
                 shell,
                 shellArgs,
@@ -336,12 +350,13 @@ export class QwenRunner extends EventEmitter {
                 cols: 120,
                 rows: 40,
                 cwd: entry.projectPath,
-                env: { ...process.env },
+                env: sanitizePtyEnv(),
             });
         }
         catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             const detail = `Failed to launch Qwen PTY (shell=${shell}, cwd=${entry.projectPath}). ${message}`;
+            entry.status = "failed";
             this.writeTrace(entry, "launch-error", { shell, shellArgs, cwd: entry.projectPath, message });
             this.emit("error", entry.id, detail);
             this.emit("status", entry.id, "failed");

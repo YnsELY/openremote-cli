@@ -12,6 +12,18 @@ import { buildShellCommand, getShellLaunch, resolveExecutable } from "./shell.js
 function ts() {
     return `[${new Date().toISOString()}] [runner]`;
 }
+function sanitizePtyEnv(extra) {
+    const env = {};
+    for (const [key, value] of Object.entries(process.env)) {
+        if (typeof value === "string") {
+            env[key] = value;
+        }
+    }
+    for (const [key, value] of Object.entries(extra)) {
+        env[key] = value;
+    }
+    return env;
+}
 const MODE_HANDSHAKE_TIMEOUT_MS = 8_000;
 const IDLE_OUTPUT_TIMEOUT_MS = 15_000;
 const MAX_MODE_SWITCH_ATTEMPTS = 2;
@@ -283,6 +295,7 @@ export class CodexRunner extends EventEmitter {
         const resolvedCodex = isWin ? null : resolveExecutable("codex");
         if (!existsSync(entry.projectPath)) {
             const detail = `Failed to launch Codex PTY because the working directory does not exist: ${entry.projectPath}`;
+            entry.status = "failed";
             this.writeTrace(entry, "launch-error", {
                 shell: null,
                 shellArgs: null,
@@ -310,6 +323,7 @@ export class CodexRunner extends EventEmitter {
         const shellArgs = isWin ? ["/c", "codex", ...args] : unixShell.argsForCommand(unixCommand);
         if (!isWin && !resolvedCodex) {
             const detail = "Failed to launch Codex PTY because the codex binary could not be resolved from the login shell PATH.";
+            entry.status = "failed";
             this.writeTrace(entry, "launch-error", {
                 shell,
                 shellArgs,
@@ -330,12 +344,13 @@ export class CodexRunner extends EventEmitter {
                 cols: 120,
                 rows: 40,
                 cwd: entry.projectPath,
-                env: { ...process.env, OPENAI_API_KEY: entry.apiKey },
+                env: sanitizePtyEnv({ OPENAI_API_KEY: entry.apiKey }),
             });
         }
         catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             const detail = `Failed to launch Codex PTY (shell=${shell}, cwd=${entry.projectPath}). ${message}`;
+            entry.status = "failed";
             this.writeTrace(entry, "launch-error", { shell, shellArgs, cwd: entry.projectPath, message });
             this.emit("error", entry.id, detail);
             this.emit("status", entry.id, "failed");
