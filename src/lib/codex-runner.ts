@@ -8,7 +8,6 @@ import * as pty from "node-pty";
 import { findCodexSessionIdForProject } from "./codex-session-store.js";
 import { log } from "./logger.js";
 import type { ProviderRunner, ProviderSessionOptions } from "./provider-runner.js";
-import { buildShellCommand, getShellLaunch } from "./shell.js";
 import type { ParsedOption, RunnerEvents, SessionStatus } from "./types.js";
 
 function ts() {
@@ -408,13 +407,9 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       cwd: entry.projectPath,
     });
 
-    const shellLaunch = getShellLaunch();
-    const shellCommand =
-      process.platform === "win32"
-        ? ["codex", ...args].join(" ")
-        : buildShellCommand("codex", args);
-    const shell = shellLaunch.shell;
-    const shellArgs = shellLaunch.argsForCommand(shellCommand);
+    const isWin = process.platform === "win32";
+    const shell = isWin ? "cmd.exe" : "codex";
+    const shellArgs = isWin ? ["/c", "codex", ...args] : args;
 
     let processPty: pty.IPty;
     try {

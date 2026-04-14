@@ -4,7 +4,6 @@ import { homedir } from "node:os";
 import path from "node:path";
 import * as pty from "node-pty";
 import { log } from "./logger.js";
-import { buildShellCommand, getShellLaunch } from "./shell.js";
 function ts() {
     return `[${new Date().toISOString()}] [qwen-runner]`;
 }
@@ -291,12 +290,9 @@ export class QwenRunner extends EventEmitter {
             cwd: entry.projectPath,
             providerSessionId: entry.providerSessionId,
         });
-        const shellLaunch = getShellLaunch();
-        const shellCommand = process.platform === "win32"
-            ? ["qwen", ...args].join(" ")
-            : buildShellCommand("qwen", args);
-        const shell = shellLaunch.shell;
-        const shellArgs = shellLaunch.argsForCommand(shellCommand);
+        const isWin = process.platform === "win32";
+        const shell = isWin ? "cmd.exe" : "qwen";
+        const shellArgs = isWin ? ["/c", "qwen", ...args] : args;
         let processPty;
         try {
             processPty = pty.spawn(shell, shellArgs, {

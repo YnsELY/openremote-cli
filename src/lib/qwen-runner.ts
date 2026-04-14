@@ -5,7 +5,6 @@ import path from "node:path";
 import * as pty from "node-pty";
 import { log } from "./logger.js";
 import type { ProviderRunner, ProviderSessionOptions } from "./provider-runner.js";
-import { buildShellCommand, getShellLaunch } from "./shell.js";
 import type { ParsedOption, RunnerEvents, SessionStatus } from "./types.js";
 
 function ts() {
@@ -385,13 +384,9 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
       providerSessionId: entry.providerSessionId,
     });
 
-    const shellLaunch = getShellLaunch();
-    const shellCommand =
-      process.platform === "win32"
-        ? ["qwen", ...args].join(" ")
-        : buildShellCommand("qwen", args);
-    const shell = shellLaunch.shell;
-    const shellArgs = shellLaunch.argsForCommand(shellCommand);
+    const isWin = process.platform === "win32";
+    const shell = isWin ? "cmd.exe" : "qwen";
+    const shellArgs = isWin ? ["/c", "qwen", ...args] : args;
 
     let processPty: pty.IPty;
     try {
