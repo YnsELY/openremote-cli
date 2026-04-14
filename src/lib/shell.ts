@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 function quotePosix(arg: string): string {
@@ -5,10 +6,23 @@ function quotePosix(arg: string): string {
 }
 
 export function getUnixShell(): string {
-  if (process.env.SHELL && process.env.SHELL.trim()) {
-    return process.env.SHELL.trim();
+  const candidate = process.env.SHELL?.trim();
+  if (candidate && existsSync(candidate)) {
+    return candidate;
   }
-  return process.platform === "darwin" ? "/bin/zsh" : "/bin/bash";
+
+  const fallbacks =
+    process.platform === "darwin"
+      ? ["/bin/zsh", "/bin/bash", "/bin/sh"]
+      : ["/bin/bash", "/bin/sh", "/usr/bin/bash"];
+
+  for (const fallback of fallbacks) {
+    if (existsSync(fallback)) {
+      return fallback;
+    }
+  }
+
+  return "/bin/sh";
 }
 
 export function buildShellCommand(command: string, args: string[]): string {

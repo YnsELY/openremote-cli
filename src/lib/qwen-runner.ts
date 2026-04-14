@@ -393,13 +393,27 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
     const shell = shellLaunch.shell;
     const shellArgs = shellLaunch.argsForCommand(shellCommand);
 
-    const processPty = pty.spawn(shell, shellArgs, {
-      name: "xterm-256color",
-      cols: 120,
-      rows: 40,
-      cwd: entry.projectPath,
-      env: { ...process.env } as Record<string, string>,
-    });
+    let processPty: pty.IPty;
+    try {
+      processPty = pty.spawn(shell, shellArgs, {
+        name: "xterm-256color",
+        cols: 120,
+        rows: 40,
+        cwd: entry.projectPath,
+        env: { ...process.env } as Record<string, string>,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const detail =
+        `Failed to launch Qwen PTY (shell=${shell}, cwd=${entry.projectPath}). ${message}`;
+      this.writeTrace(entry, "launch-error", { shell, shellArgs, cwd: entry.projectPath, message });
+      this.emit("error", entry.id, detail);
+      this.emit("status", entry.id, "failed");
+      this.emit("complete", entry.id, 1, Date.now() - entry.startedAt);
+      this.closeTrace(entry);
+      this.sessions.delete(entry.id);
+      return;
+    }
 
     entry.launchId += 1;
     const launchId = entry.launchId;
