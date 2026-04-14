@@ -1,7 +1,7 @@
-import readline from "node:readline";
 import { log } from "../lib/logger.js";
 import { loadConfig, updateConfig } from "../lib/config.js";
 import { setAuthToken, hasAuthToken } from "../lib/credentials.js";
+import { ask, askSecret } from "../lib/prompt.js";
 
 export async function loginCommand(): Promise<void> {
   log.header("OpenRemote");
@@ -21,13 +21,13 @@ export async function loginCommand(): Promise<void> {
     return;
   }
 
-  const email = await promptInput("Email: ");
+  const email = await ask("Email:");
   if (!email) {
     log.card("Email is required", ["Enter a valid email address and retry."], "danger");
     process.exit(1);
   }
 
-  const password = await promptPassword("Password: ");
+  const password = await askSecret("Password:");
   if (!password) {
     log.card("Password is required", ["Enter your password and retry."], "danger");
     process.exit(1);
@@ -87,74 +87,4 @@ export async function loginCommand(): Promise<void> {
     ["Machine", `${config.machineId.slice(0, 8)}...`],
   ]);
   log.nextStep("Run openremote start");
-}
-
-function promptInput(message: string): Promise<string> {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-
-    rl.question(message, (answer) => {
-      rl.close();
-      resolve(answer);
-    });
-  });
-}
-
-function promptPassword(message: string): Promise<string> {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: true,
-    });
-
-    let password = "";
-
-    if (process.stdin.isTTY) {
-      process.stdin.setRawMode(true);
-    }
-
-    process.stdout.write(message);
-
-    const onData = (chunk: Buffer) => {
-      const ch = chunk.toString("utf-8");
-
-      if (ch === "\r" || ch === "\n") {
-        if (process.stdin.isTTY) {
-          process.stdin.setRawMode(false);
-        }
-        process.stdin.removeListener("data", onData);
-        rl.close();
-        process.stdout.write("\n");
-        resolve(password);
-        return;
-      }
-
-      if (ch === "\x03") {
-        if (process.stdin.isTTY) {
-          process.stdin.setRawMode(false);
-        }
-        process.stdin.removeListener("data", onData);
-        rl.close();
-        process.exit(0);
-        return;
-      }
-
-      if (ch === "\x7f" || ch === "\b") {
-        if (password.length > 0) {
-          password = password.slice(0, -1);
-          process.stdout.write("\b \b");
-        }
-        return;
-      }
-
-      password += ch;
-      process.stdout.write("*");
-    };
-
-    process.stdin.on("data", onData);
-  });
 }
