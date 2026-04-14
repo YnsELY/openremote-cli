@@ -1,9 +1,11 @@
 /**
- * Windows-local secret storage via DPAPI (Data Protection API).
+ * Local credential storage.
  *
- * Secrets are encrypted with the current Windows user's credentials and stored
- * in a local file. Only the same user on the same machine can decrypt them.
- * No native modules are required.
+ * - Windows: DPAPI-encrypted file bound to the current user.
+ * - macOS/Linux: local JSON file restricted to the current user (mode 600).
+ *
+ * The macOS/Linux fallback is intentionally simple so the CLI remains usable
+ * without depending on platform-specific keychain tooling.
  */
 export declare function getApiKey(): string | null;
 export declare function setApiKey(key: string): void;

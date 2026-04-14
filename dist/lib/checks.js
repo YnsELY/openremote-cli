@@ -97,21 +97,27 @@ export function checkConfig() {
 }
 export function checkApiKey() {
     const has = hasApiKey();
+    const detail = process.platform === "win32"
+        ? "Stored in local encrypted credential store"
+        : "Stored in local credential file";
     return {
         name: "OpenAI API Key",
         ok: has,
         detail: has
-            ? "Stored in local encrypted credential store"
+            ? detail
             : "Not set. Run: openremote setup",
     };
 }
 export function checkAuthToken() {
     const has = hasAuthToken();
+    const detail = process.platform === "win32"
+        ? "Stored in local encrypted credential store"
+        : "Stored in local credential file";
     return {
         name: "Machine Token",
         ok: has,
         detail: has
-            ? "Stored in local encrypted credential store"
+            ? detail
             : "Not set. Run: openremote login",
     };
 }

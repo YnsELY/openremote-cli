@@ -1,16 +1,18 @@
 /**
- * Windows-local secret storage via DPAPI (Data Protection API).
+ * Local credential storage.
  *
- * Secrets are encrypted with the current Windows user's credentials and stored
- * in a local file. Only the same user on the same machine can decrypt them.
- * No native modules are required.
+ * - Windows: DPAPI-encrypted file bound to the current user.
+ * - macOS/Linux: local JSON file restricted to the current user (mode 600).
+ *
+ * The macOS/Linux fallback is intentionally simple so the CLI remains usable
+ * without depending on platform-specific keychain tooling.
  */
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync, } from "node:fs";
 import { join } from "node:path";
 import { ensureConfigDir, getConfigDir } from "./config.js";
 function credFile() {
-    return join(getConfigDir(), "credentials.enc");
+    return join(getConfigDir(), process.platform === "win32" ? "credentials.enc" : "credentials.json");
 }
 function dpApiEncrypt(plaintext) {
     const ps = [
@@ -37,14 +39,45 @@ function dpApiDecrypt(encrypted) {
         windowsHide: true,
     }).trim();
 }
-function loadStore() {
+function readCredentialFile() {
     const file = credFile();
-    if (!existsSync(file))
-        return {};
+    if (!existsSync(file)) {
+        return null;
+    }
     try {
-        const raw = readFileSync(file, "utf-8").trim();
-        const json = dpApiDecrypt(raw);
-        return JSON.parse(json);
+        return readFileSync(file, "utf-8").trim();
+    }
+    catch {
+        return null;
+    }
+}
+function writeCredentialFile(contents) {
+    ensureConfigDir();
+    const file = credFile();
+    writeFileSync(file, contents, {
+        encoding: "utf-8",
+        mode: 0o600,
+    });
+    if (process.platform !== "win32") {
+        try {
+            chmodSync(file, 0o600);
+        }
+        catch {
+            // Ignore chmod errors on filesystems that do not support POSIX modes.
+        }
+    }
+}
+function loadStore() {
+    const raw = readCredentialFile();
+    if (!raw) {
+        return {};
+    }
+    try {
+        if (process.platform === "win32") {
+            const json = dpApiDecrypt(raw);
+            return JSON.parse(json);
+        }
+        return JSON.parse(raw);
     }
     catch {
         return {};
@@ -56,9 +89,11 @@ function saveStore(store) {
         return;
     }
     const json = JSON.stringify(store);
-    const encrypted = dpApiEncrypt(json);
-    ensureConfigDir();
-    writeFileSync(credFile(), encrypted, "utf-8");
+    if (process.platform === "win32") {
+        writeCredentialFile(dpApiEncrypt(json));
+        return;
+    }
+    writeCredentialFile(json);
 }
 function updateStore(mutator) {
     const store = loadStore();

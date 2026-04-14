@@ -1,6 +1,16 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-const CONFIG_DIR = join(process.env.APPDATA ?? join(process.env.HOME ?? ".", "AppData", "Roaming"), "CodexRemote");
+function resolveConfigDir() {
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? ".";
+    if (process.platform === "win32") {
+        return join(process.env.APPDATA ?? join(home, "AppData", "Roaming"), "CodexRemote");
+    }
+    if (process.platform === "darwin") {
+        return join(home, "Library", "Application Support", "CodexRemote");
+    }
+    return join(process.env.XDG_CONFIG_HOME ?? join(home, ".config"), "CodexRemote");
+}
+const CONFIG_DIR = resolveConfigDir();
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 function normalizeConfig(raw) {
     const supabaseUrl = raw.supabaseUrl ?? raw.backendUrl;
