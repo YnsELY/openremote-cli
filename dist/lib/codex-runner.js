@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -7,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import * as pty from "node-pty";
 import { findCodexSessionIdForProject } from "./codex-session-store.js";
 import { log } from "./logger.js";
-import { resolveExecutable } from "./shell.js";
+import { buildShellCommand, getShellLaunch, resolveExecutable } from "./shell.js";
 function ts() {
     return `[${new Date().toISOString()}] [runner]`;
 }
@@ -280,6 +281,21 @@ export class CodexRunner extends EventEmitter {
         log.debug(`${ts()} cwd: ${entry.projectPath}`);
         const isWin = process.platform === "win32";
         const resolvedCodex = isWin ? null : resolveExecutable("codex");
+        if (!existsSync(entry.projectPath)) {
+            const detail = `Failed to launch Codex PTY because the working directory does not exist: ${entry.projectPath}`;
+            this.writeTrace(entry, "launch-error", {
+                shell: null,
+                shellArgs: null,
+                cwd: entry.projectPath,
+                message: detail,
+            });
+            this.emit("error", entry.id, detail);
+            this.emit("status", entry.id, "failed");
+            this.emit("complete", entry.id, 1, Date.now() - entry.startedAt);
+            this.closeTrace(entry);
+            this.sessions.delete(entry.id);
+            return;
+        }
         this.writeTrace(entry, "launch", {
             resume,
             desiredPlanMode: entry.desiredPlanMode,
@@ -288,8 +304,10 @@ export class CodexRunner extends EventEmitter {
             cwd: entry.projectPath,
             resolvedExecutable: resolvedCodex,
         });
-        const shell = isWin ? "cmd.exe" : resolvedCodex ?? "codex";
-        const shellArgs = isWin ? ["/c", "codex", ...args] : args;
+        const unixCommand = `exec ${buildShellCommand("codex", args)}`;
+        const unixShell = getShellLaunch();
+        const shell = isWin ? "cmd.exe" : unixShell.shell;
+        const shellArgs = isWin ? ["/c", "codex", ...args] : unixShell.argsForCommand(unixCommand);
         if (!isWin && !resolvedCodex) {
             const detail = "Failed to launch Codex PTY because the codex binary could not be resolved from the login shell PATH.";
             this.writeTrace(entry, "launch-error", {

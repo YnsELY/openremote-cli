@@ -1,11 +1,12 @@
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import * as pty from "node-pty";
 import { log } from "./logger.js";
 import type { ProviderRunner, ProviderSessionOptions } from "./provider-runner.js";
-import { resolveExecutable } from "./shell.js";
+import { buildShellCommand, getShellLaunch, resolveExecutable } from "./shell.js";
 import type { ParsedOption, RunnerEvents, SessionStatus } from "./types.js";
 
 function ts() {
@@ -380,6 +381,21 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
     log.debug(`${ts()} cwd: ${entry.projectPath}`);
     const isWin = process.platform === "win32";
     const resolvedQwen = isWin ? null : resolveExecutable("qwen");
+    if (!existsSync(entry.projectPath)) {
+      const detail = `Failed to launch Qwen PTY because the working directory does not exist: ${entry.projectPath}`;
+      this.writeTrace(entry, "launch-error", {
+        shell: null,
+        shellArgs: null,
+        cwd: entry.projectPath,
+        message: detail,
+      });
+      this.emit("error", entry.id, detail);
+      this.emit("status", entry.id, "failed");
+      this.emit("complete", entry.id, 1, Date.now() - entry.startedAt);
+      this.closeTrace(entry);
+      this.sessions.delete(entry.id);
+      return;
+    }
     this.writeTrace(entry, "launch", {
       resume,
       args,
@@ -388,8 +404,10 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
       resolvedExecutable: resolvedQwen,
     });
 
-    const shell = isWin ? "cmd.exe" : resolvedQwen ?? "qwen";
-    const shellArgs = isWin ? ["/c", "qwen", ...args] : args;
+    const unixCommand = `exec ${buildShellCommand("qwen", args)}`;
+    const unixShell = getShellLaunch();
+    const shell = isWin ? "cmd.exe" : unixShell.shell;
+    const shellArgs = isWin ? ["/c", "qwen", ...args] : unixShell.argsForCommand(unixCommand);
 
     if (!isWin && !resolvedQwen) {
       const detail =
