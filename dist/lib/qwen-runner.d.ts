@@ -1,8 +1,8 @@
 import { EventEmitter } from "node:events";
 import type { ProviderRunner, ProviderSessionOptions } from "./provider-runner.js";
 import type { RunnerEvents } from "./types.js";
-export declare class CodexRunner extends EventEmitter implements ProviderRunner {
-    readonly provider: "codex";
+export declare class QwenRunner extends EventEmitter implements ProviderRunner {
+    readonly provider: "qwen";
     private sessions;
     on<K extends keyof RunnerEvents>(event: K, fn: RunnerEvents[K]): this;
     emit<K extends keyof RunnerEvents>(event: K, ...args: Parameters<RunnerEvents[K]>): boolean;
@@ -12,33 +12,20 @@ export declare class CodexRunner extends EventEmitter implements ProviderRunner 
         ok: boolean;
         error?: string;
     };
-    inputToSession(sessionId: string, text: string, modelName?: string, planMode?: boolean, reasoningEffort?: string, approvalMode?: "full-auto" | "auto-edit" | "suggest"): boolean;
+    inputToSession(sessionId: string, text: string, modelName?: string, _planMode?: boolean, reasoningEffort?: string, approvalMode?: "full-auto" | "auto-edit" | "suggest"): boolean;
     cancelSession(sessionId: string): boolean;
     finishSession(sessionId: string): boolean;
-    hasActiveSession(): boolean;
-    getActiveSessionId(): string | null;
     killAll(): void;
     private launchProcess;
     private buildArgs;
-    private beginModeHandshake;
-    private startModeHandshakeTimer;
-    private handleDetectedMode;
-    private completeModeHandshake;
-    private failModeHandshake;
-    private sendShiftTab;
-    private desiredCliMode;
-    private modeMatchesTarget;
-    private detectCliMode;
-    private detectCliReady;
+    private mapApprovalMode;
     private parsePrompt;
+    private detectGenericApproval;
     private raiseApproval;
+    private respondToDetectedApproval;
     private extractApprovalTextParts;
     private stripAnsi;
-    private beginCodexSessionDiscovery;
-    private clearRuntimeTimers;
     private ensureTrace;
     private writeTrace;
     private closeTrace;
-    private submitPrompt;
-    private openMirrorWindow;
 }

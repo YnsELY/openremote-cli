@@ -7,6 +7,9 @@ import { statusCommand } from "./commands/status.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { logoutCommand } from "./commands/logout.js";
 import { configureLogger } from "./lib/logger.js";
+import { printBanner } from "./lib/banner.js";
+// Display OpenRemote banner
+printBanner();
 const program = new Command();
 function withCliContext(action) {
     return async (...args) => {

@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import { configExists, loadConfig } from "./config.js";
 import { hasApiKey, hasAuthToken } from "./credentials.js";
+import type { AgentProvider } from "./types.js";
 
 export interface CheckResult {
   name: string;
@@ -76,6 +77,17 @@ export function checkQwenCli(): CheckResult {
     ok: false,
     detail: "Not found. Install with: npm install -g @alibaba-cloud/qwen-cli",
   };
+}
+
+export function getSupportedProviders(): AgentProvider[] {
+  const supported: AgentProvider[] = [];
+  if (checkCodexCli().ok) {
+    supported.push("codex");
+  }
+  if (checkQwenCli().ok) {
+    supported.push("qwen");
+  }
+  return supported;
 }
 
 export function checkConfig(): CheckResult {

@@ -3,9 +3,11 @@ export interface DashboardState {
     machineId: string;
     user: string;
     machineStatus: string;
+    activeSessions: number;
     sessionId: string;
     sessionState: string;
     sessionDetail: string;
+    providerName: string;
     modelName: string;
     reasoning: string;
     approvalMode: string;
@@ -56,6 +58,7 @@ export declare class TerminalUI {
     private writeDashboardBlock;
     private renderHeader;
     private renderDashboard;
+    private makeActiveSessionsLine;
     private makeMachineSessionCard;
     private makeModelCard;
     private makeMachineConnectedCard;

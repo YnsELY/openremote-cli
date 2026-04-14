@@ -9,6 +9,7 @@ export interface AppConfig {
     backendUrl?: string;
 }
 export type MachineAvailabilityState = "offline" | "idle" | "busy" | "revoked";
+export type AgentProvider = "codex" | "qwen";
 export type SessionStatus = "queued" | "running" | "busy" | "idle" | "completed" | "failed" | "cancelled";
 export interface ParsedOption {
     index: number;
@@ -47,6 +48,9 @@ export interface SessionApprovalMsg {
     type: "session:approval";
     payload: {
         sessionId: string;
+        requestId: string;
+        title?: string;
+        provider: AgentProvider;
         message: string;
         options: {
             label: string;
@@ -79,7 +83,7 @@ export interface SessionMetaMsg {
     type: "session:meta";
     payload: {
         sessionId: string;
-        codexSessionId: string;
+        providerSessionId: string;
     };
 }
 export type OutboundMessage = MachineHelloMsg | MachineOfflineMsg | SessionOutputMsg | SessionStatusMsg | SessionApprovalMsg | SessionCompleteMsg | SessionErrorMsg | SessionBusyMsg | SessionMetaMsg;
@@ -91,11 +95,13 @@ export interface SessionStartMsg {
     type: "session:start";
     payload: {
         sessionId: string;
+        provider: AgentProvider;
         prompt: string;
         modelName: string;
         reasoningEffort: string;
         projectPath: string;
         approvalMode: "full-auto" | "auto-edit" | "suggest";
+        planMode: boolean;
         forceReplace?: boolean;
     };
 }
@@ -109,6 +115,7 @@ export interface SessionRespondMsg {
     type: "session:respond";
     payload: {
         sessionId: string;
+        requestId: string;
         optionIndex: number;
     };
 }
@@ -117,11 +124,13 @@ export interface SessionInputMsg {
     payload: {
         sessionId: string;
         text: string;
+        provider?: AgentProvider;
         modelName?: string;
+        planMode?: boolean;
         reasoningEffort?: string;
         projectPath?: string;
         approvalMode?: "full-auto" | "auto-edit" | "suggest";
-        codexSessionId?: string | null;
+        providerSessionId?: string | null;
         forceReplace?: boolean;
     };
 }
@@ -158,6 +167,7 @@ export interface SessionPatch {
     exitCode?: number | null;
     durationMs?: number | null;
     completedAt?: string | null;
+    providerSessionId?: string | null;
     codexSessionId?: string | null;
 }
 export interface RunnerEvents {
@@ -165,6 +175,7 @@ export interface RunnerEvents {
     error: (sessionId: string, error: string) => void;
     status: (sessionId: string, status: SessionStatus) => void;
     complete: (sessionId: string, exitCode: number, duration: number) => void;
-    approval: (sessionId: string, message: string, options: ParsedOption[]) => void;
-    codexSession: (sessionId: string, codexSessionId: string) => void;
+    approval: (sessionId: string, requestId: string, title: string | null, message: string, options: ParsedOption[]) => void;
+    providerSession: (sessionId: string, providerSessionId: string) => void;
+    sessionLog: (sessionId: string, tracePath: string) => void;
 }

@@ -1,6 +1,5 @@
 import boxen from "boxen";
 import chalk from "chalk";
-import gradient from "gradient-string";
 import { createLogUpdate } from "log-update";
 const SPINNER_FRAMES = [
     "\u280b",
@@ -18,9 +17,11 @@ const DEFAULT_DASHBOARD = {
     machineId: "-",
     user: "Unknown",
     machineStatus: "offline",
+    activeSessions: 0,
     sessionId: "-",
     sessionState: "idle",
     sessionDetail: "Waiting for a session",
+    providerName: "-",
     modelName: "-",
     reasoning: "-",
     approvalMode: "-",
@@ -277,60 +278,27 @@ export class TerminalUI {
         }
     }
     renderHeader() {
-        const columns = process.stdout.columns ?? 120;
-        if (columns < 84) {
-            const compact = [
-                gradient(["#79b8ff", "#9a8cff"])(">>>> // <<<<"),
-                gradient(["#7db4ff", "#9c86ff", "#ff8ea1"])("OpenRemote"),
-                chalk.gray("Download the App on the Appstore"),
-            ].join("\n");
-            return boxen(compact, {
-                padding: { top: 0, bottom: 0, left: 1, right: 1 },
-                margin: { top: 0, bottom: 1, left: 0, right: 0 },
-                borderStyle: "round",
-                borderColor: "gray",
-            });
-        }
-        const iconRaw = [
-            "  >>>>>  <<<<<  ",
-            "  >>>  //  <<<  ",
-            "  <<<<<  >>>>>  ",
-        ];
-        const titleRaw = [
-            "OpenRemote",
-            "Download the App OpenRemote on the Appstore",
-        ];
-        const iconWidth = Math.max(...iconRaw.map((l) => l.length));
-        const height = Math.max(iconRaw.length, titleRaw.length);
-        const rows = [];
-        for (let i = 0; i < height; i += 1) {
-            const iconPart = (iconRaw[i] ?? "").padEnd(iconWidth);
-            const colored = gradient(["#79b8ff", "#9a8cff"])(iconPart);
-            const titlePart = i === 0
-                ? gradient(["#7db4ff", "#9c86ff", "#ff8ea1"])(titleRaw[i] ?? "")
-                : chalk.gray(titleRaw[i] ?? "");
-            rows.push(`${colored}   ${titlePart}`.trimEnd());
-        }
-        return boxen(rows.join("\n"), {
-            padding: { top: 1, bottom: 1, left: 2, right: 2 },
-            margin: { top: 0, bottom: 1, left: 0, right: 0 },
-            borderStyle: "round",
-            borderColor: "gray",
-        });
+        return chalk.gray("Download the App OpenRemote on the Appstore or on the Playstore") + "\n";
     }
     renderDashboard() {
         if (!this.dashboard)
             return "";
         const columns = process.stdout.columns ?? 120;
         const machineSessionCard = this.makeMachineSessionCard(columns);
+        const activeSessionsLine = this.makeActiveSessionsLine();
         const machineConnectedCard = this.makeMachineConnectedCard(columns);
         const modelCard = this.makeModelCard(columns);
         const tipsCard = this.makeTipsCard(this.dashboard.tips, columns);
         if (columns >= 110) {
             const topRow = joinHorizontal([machineSessionCard, [modelCard, tipsCard].join("\n\n")], 2);
-            return [topRow, machineConnectedCard].join("\n\n");
+            return [topRow, activeSessionsLine, machineConnectedCard].join("\n\n");
         }
-        return [machineSessionCard, modelCard, tipsCard, machineConnectedCard].join("\n\n");
+        return [machineSessionCard, modelCard, tipsCard, activeSessionsLine, machineConnectedCard].join("\n\n");
+    }
+    makeActiveSessionsLine() {
+        if (!this.dashboard)
+            return "";
+        return `${chalk.white("Active sessions:")} ${chalk.cyanBright.bold(String(this.dashboard.activeSessions))}`;
     }
     makeMachineSessionCard(columns) {
         if (!this.dashboard)
@@ -365,7 +333,7 @@ export class TerminalUI {
             ? Math.min(Math.max(Math.floor(columns * 0.36) - 4, 34), 48)
             : 38;
         const rows = [
-            ["Platform", "Codex"],
+            ["Platform", this.dashboard.providerName],
             ["Model", this.dashboard.modelName],
             ["Reasoning", this.dashboard.reasoning],
         ];

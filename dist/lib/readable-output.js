@@ -2,13 +2,39 @@ const INLINE_BULLET_SEPARATOR = /\s+[\u2022\u00b7]\s+/g;
 const INLINE_COMMAND_START = /\s+(?=(?:Running|Ran|Run)\s+(?:\$[A-Za-z_]\w*\s*=|PS\s|[A-Za-z]:\\|rg\b|fd\b|grep\b|git\b|npm\b|npx\b|pnpm\b|yarn\b|node\b|python\b|pip\b|uv\b|cargo\b|go\b|deno\b|docker\b|powershell\b|cmd\b|Get-|Set-|New-|Remove-|Move-|Copy-|Select-String|Select-Object|Get-Content|Test-Path|Set-Content|Add-Content))/i;
 const INLINE_PATH_REGEX = /(?:[A-Za-z]:\\[^\s"'<>|?*]+(?:\\[^\s"'<>|?*]+)*|(?:\.{0,2}[\\/])?[A-Za-z0-9_.@()-]+(?:[\\/][A-Za-z0-9_.@() -]+)+)/g;
 function stripAnsiAndControl(text) {
-    return text
+    return normalizeCarriageReturns(text)
         .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "")
         .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
-        .replace(/\r\n/g, "\n")
-        .replace(/\r(?!\n)/g, "\n")
         .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
         .replace(/\u001b/g, "");
+}
+function normalizeCarriageReturns(text) {
+    const lines = [];
+    let current = "";
+    for (let index = 0; index < text.length; index += 1) {
+        const char = text[index];
+        if (char === "\r") {
+            if (text[index + 1] === "\n") {
+                lines.push(current);
+                current = "";
+                index += 1;
+            }
+            else {
+                current = "";
+            }
+            continue;
+        }
+        if (char === "\n") {
+            lines.push(current);
+            current = "";
+            continue;
+        }
+        current += char;
+    }
+    if (current.length > 0) {
+        lines.push(current);
+    }
+    return lines.join("\n");
 }
 function normalizeTerminalStream(text) {
     return repairMojibake(stripAnsiAndControl(text)
@@ -46,6 +72,60 @@ function normalizeForDedup(kind, body) {
     }
     return n;
 }
+function normalizeReadableText(body) {
+    return body
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .replace(/[.,;:!?]+$/g, "")
+        .trim();
+}
+function isTextContinuation(previousBody, nextBody) {
+    const previous = normalizeReadableText(previousBody);
+    const next = normalizeReadableText(nextBody);
+    if (!previous || !next) {
+        return false;
+    }
+    return previous === next || next.startsWith(previous) || previous.startsWith(next);
+}
+function normalizeTransientProgressText(text) {
+    return text
+        .toLowerCase()
+        .replace(/\([^)]*\d+\s*s[^)]*\)/gi, " ")
+        .replace(/\b\d+\s*s\b/gi, " ")
+        .replace(/[\u2026.]{2,}/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+function isTransientProgressText(text) {
+    const normalized = collapseWhitespace(stripBulletPrefix(text));
+    if (!normalized) {
+        return false;
+    }
+    if (isCommandLine(normalized) ||
+        isErrorLine(normalized) ||
+        isPathLine(normalized) ||
+        isCodeBlockLine(normalized)) {
+        return false;
+    }
+    const base = normalizeTransientProgressText(normalized);
+    if (base.length < 12) {
+        return false;
+    }
+    return (/\([^)]*\d+\s*s[^)]*\)/i.test(normalized) ||
+        /\b\d+\s*s\b/i.test(normalized) ||
+        /\u2026|\.{3}/.test(normalized) ||
+        /^(just a moment|finding|searching|looking|checking|reading|opening|locating|reviewing|analyzing|analysing|updating|loading|preparing|scanning|inspecting|exploring|i need to|i'm|i am)/i.test(normalized));
+}
+function sameTransientProgressText(left, right) {
+    const normalizedLeft = normalizeTransientProgressText(left);
+    const normalizedRight = normalizeTransientProgressText(right);
+    if (!normalizedLeft || !normalizedRight) {
+        return false;
+    }
+    return (normalizedLeft === normalizedRight ||
+        normalizedLeft.startsWith(normalizedRight) ||
+        normalizedRight.startsWith(normalizedLeft));
+}
 function collapseWhitespace(text) {
     return text.replace(/\s+/g, " ").trim();
 }
@@ -69,6 +149,8 @@ function isTerminalChromeLine(text) {
         lower.includes("openai codex") ||
         lower.includes("tip: new try the codex app") ||
         lower.includes("chatgpt.com/codex") ||
+        lower.includes("auto-accept edits") ||
+        lower.includes("tab to cycle") ||
         lower.includes("model to change") ||
         lower.startsWith("model:") ||
         lower.startsWith("directory:") ||
@@ -326,7 +408,39 @@ function appendGroupedBlock(grouped, candidate) {
         previous.kind === candidate.kind &&
         previous.body !== candidate.body &&
         previous.body.length + candidate.body.length < 1200) {
+        if (candidate.kind === "text" &&
+            !isTransientProgressText(previous.body) &&
+            !isTransientProgressText(candidate.body) &&
+            isTextContinuation(previous.body, candidate.body)) {
+            if (candidate.body.length >= previous.body.length) {
+                previous.body = candidate.body;
+            }
+            return;
+        }
+        if (candidate.kind === "text" &&
+            isTransientProgressText(previous.body) &&
+            isTransientProgressText(candidate.body) &&
+            sameTransientProgressText(previous.body, candidate.body)) {
+            if (candidate.body.length >= previous.body.length) {
+                previous.body = candidate.body;
+            }
+            return;
+        }
+        const previousNormalized = normalizeForDedup(previous.kind, previous.body);
+        const candidateNormalized = normalizeForDedup(candidate.kind, candidate.body);
+        if (candidateNormalized.startsWith(previousNormalized) ||
+            previousNormalized.startsWith(candidateNormalized)) {
+            if (candidate.body.length >= previous.body.length) {
+                previous.body = candidate.body;
+            }
+            return;
+        }
         const joiner = candidate.kind === "command" ? "\n" : "\n\n";
+        if (candidate.kind === "text" &&
+            (isTransientProgressText(previous.body) || isTransientProgressText(candidate.body))) {
+            grouped.push({ ...candidate });
+            return;
+        }
         previous.body = `${previous.body}${joiner}${candidate.body}`;
         return;
     }

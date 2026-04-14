@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import type { AppConfig, InboundMessage, OutboundMessage } from "./types.js";
+import type { AgentProvider, AppConfig, InboundMessage, OutboundMessage } from "./types.js";
 interface BridgeEvents {
     connected: () => void;
     disconnected: () => void;
@@ -9,6 +9,7 @@ interface BridgeEvents {
 export declare class Bridge extends EventEmitter {
     private readonly config;
     private readonly machineToken;
+    private readonly supportedProviders;
     private client;
     private machineChannel;
     private heartbeatTimer;
@@ -20,7 +21,7 @@ export declare class Bridge extends EventEmitter {
     private machineAccessTokenExpiresAt;
     private machineState;
     private readonly sessions;
-    constructor(config: AppConfig, machineToken: string);
+    constructor(config: AppConfig, machineToken: string, supportedProviders: AgentProvider[]);
     on<K extends keyof BridgeEvents>(event: K, fn: BridgeEvents[K]): this;
     emit<K extends keyof BridgeEvents>(event: K, ...args: Parameters<BridgeEvents[K]>): boolean;
     connect(): void;
@@ -35,7 +36,7 @@ export declare class Bridge extends EventEmitter {
     private flushOutputBuffer;
     private flushAllOutputs;
     private makeEvent;
-    private deriveMachineState;
+    private recomputeMachineState;
     private ingest;
     private sendHeartbeat;
     private startHeartbeatLoop;

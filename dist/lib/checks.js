@@ -68,6 +68,16 @@ export function checkQwenCli() {
         detail: "Not found. Install with: npm install -g @alibaba-cloud/qwen-cli",
     };
 }
+export function getSupportedProviders() {
+    const supported = [];
+    if (checkCodexCli().ok) {
+        supported.push("codex");
+    }
+    if (checkQwenCli().ok) {
+        supported.push("qwen");
+    }
+    return supported;
+}
 export function checkConfig() {
     if (!configExists()) {
         return {

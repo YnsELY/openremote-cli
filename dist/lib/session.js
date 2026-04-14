@@ -1,19 +1,29 @@
 import { existsSync } from "node:fs";
 import { log } from "./logger.js";
 import { CodexRunner } from "./codex-runner.js";
+import { QwenRunner } from "./qwen-runner.js";
+function providerLabel(provider) {
+    return provider === "qwen" ? "Qwen" : "Codex";
+}
 /**
- * Manages a single Codex session at a time.
- * Receives commands from the bridge, delegates to CodexRunner,
+ * Manages a single provider session at a time.
+ * Receives commands from the bridge, delegates to the matching runner,
  * and streams results back through the bridge.
  */
 export class SessionManager {
     bridge;
     apiKey;
-    runner = new CodexRunner();
-    activeSessionId = null;
-    constructor(bridge, apiKey) {
+    runners;
+    sessionProviders = new Map();
+    sessionStatuses = new Map();
+    sessionLogs = new Map();
+    constructor(bridge, apiKey, supportedProviders) {
         this.bridge = bridge;
         this.apiKey = apiKey;
+        this.runners = {
+            ...(supportedProviders.includes("codex") ? { codex: new CodexRunner() } : {}),
+            ...(supportedProviders.includes("qwen") ? { qwen: new QwenRunner() } : {}),
+        };
         this.wireRunnerEvents();
     }
     handleMessage(msg) {
@@ -25,7 +35,7 @@ export class SessionManager {
                 this.handleCancel(msg.payload.sessionId);
                 break;
             case "session:respond":
-                this.handleRespond(msg.payload.sessionId, msg.payload.optionIndex);
+                this.handleRespond(msg.payload.sessionId, msg.payload.requestId, msg.payload.optionIndex);
                 break;
             case "session:input":
                 this.handleInput(msg.payload);
@@ -38,26 +48,33 @@ export class SessionManager {
         }
     }
     shutdown() {
-        this.runner.killAll();
-        this.activeSessionId = null;
+        for (const runner of Object.values(this.runners)) {
+            runner?.killAll();
+        }
+        this.sessionProviders.clear();
+        this.sessionStatuses.clear();
     }
     get busy() {
-        return this.activeSessionId !== null;
+        return this.hasBusySessions();
     }
-    handleStart(payload) {
-        if (this.activeSessionId) {
-            if (payload.forceReplace) {
-                const previousSessionId = this.activeSessionId;
-                log.step("Replacing the active session");
-                this.runner.finishSession(previousSessionId);
+    getActiveSessionCount() {
+        let count = 0;
+        for (const status of this.sessionStatuses.values()) {
+            if (status === "queued" || status === "running" || status === "busy") {
+                count += 1;
             }
         }
-        if (this.activeSessionId) {
-            log.card("Machine busy", ["Finish the current session or wait for it to become idle."], "warning");
-            this.bridge.send({
-                type: "session:busy",
-                payload: { sessionId: payload.sessionId },
-            });
+        return count;
+    }
+    updateActiveSessionCount() {
+        log.setDashboard({
+            activeSessions: this.getActiveSessionCount(),
+        });
+    }
+    handleStart(payload) {
+        const runner = this.getRunner(payload.provider);
+        if (!runner) {
+            this.failUnsupportedProvider(payload.sessionId, payload.provider);
             return;
         }
         if (!existsSync(payload.projectPath)) {
@@ -80,42 +97,84 @@ export class SessionManager {
         }
         log.step("Starting a new session");
         log.setDashboard({
+            activeSessions: this.getActiveSessionCount() + 1,
             sessionId: `${payload.sessionId.slice(0, 8)}...`,
             sessionState: "queued",
             sessionDetail: "Preparing the remote session",
+            providerName: providerLabel(payload.provider),
             modelName: payload.modelName,
             reasoning: payload.reasoningEffort,
             approvalMode: payload.approvalMode,
         });
         log.clearInfoBar();
-        this.activeSessionId = payload.sessionId;
-        this.runner.startSession(payload.sessionId, payload.projectPath, payload.prompt, payload.modelName, payload.reasoningEffort, payload.approvalMode, this.apiKey, null);
+        this.sessionProviders.set(payload.sessionId, payload.provider);
+        this.sessionStatuses.set(payload.sessionId, "queued");
+        this.updateActiveSessionCount();
+        runner.startSession({
+            sessionId: payload.sessionId,
+            projectPath: payload.projectPath,
+            prompt: payload.prompt,
+            modelName: payload.modelName,
+            reasoningEffort: payload.reasoningEffort,
+            approvalMode: payload.approvalMode,
+            planMode: payload.planMode,
+            apiKey: payload.provider === "codex" ? this.apiKey : undefined,
+            providerSessionId: payload.provider === "qwen" ? payload.sessionId : null,
+        });
     }
     handleCancel(sessionId) {
-        if (sessionId !== this.activeSessionId)
+        const runner = this.getRunnerForSession(sessionId);
+        if (!runner)
             return;
         log.step("Cancelling the current session");
-        this.runner.cancelSession(sessionId);
+        runner.cancelSession(sessionId);
     }
-    handleRespond(sessionId, optionIndex) {
-        if (sessionId !== this.activeSessionId)
+    handleRespond(sessionId, requestId, optionIndex) {
+        const runner = this.getRunnerForSession(sessionId);
+        log.debug(`[RESPOND] Received: sessionId=${sessionId}, requestId=${requestId}, optionIndex=${optionIndex}`);
+        if (!runner) {
+            log.debug("[RESPOND] Ignoring - missing runner for session");
+            this.bridge.send({
+                type: "session:error",
+                payload: {
+                    sessionId,
+                    error: "Approval could not be resolved because the session is no longer active.",
+                },
+            });
             return;
-        log.debug(`Approval response: option ${optionIndex}`);
-        this.runner.respondToSession(sessionId, optionIndex);
+        }
+        log.debug("[RESPOND] Calling runner.respondToSession()");
+        const result = runner.respondToSession(sessionId, requestId, optionIndex);
+        if (!result.ok) {
+            this.bridge.send({
+                type: "session:error",
+                payload: {
+                    sessionId,
+                    error: result.error ??
+                        "Approval could not be resolved because it is no longer pending.",
+                },
+            });
+        }
     }
     handleInput(payload) {
-        if (payload.sessionId !== this.activeSessionId && this.activeSessionId) {
-            if (payload.forceReplace) {
-                const previousSessionId = this.activeSessionId;
-                log.step("Replacing the active session for follow-up input");
-                this.runner.finishSession(previousSessionId);
-            }
-        }
-        if (payload.sessionId !== this.activeSessionId && this.activeSessionId) {
-            log.card("Couldn't send your message", ["Another session is still active on this machine."], "warning");
+        const provider = payload.provider ?? this.sessionProviders.get(payload.sessionId) ?? null;
+        if (!provider) {
+            log.card("Missing session provider", ["Open the session again after the app refreshes its data."], "warning");
+            this.bridge.send({
+                type: "session:error",
+                payload: {
+                    sessionId: payload.sessionId,
+                    error: "Session provider missing for resume",
+                },
+            });
             return;
         }
-        if (payload.sessionId !== this.activeSessionId) {
+        const runner = this.getRunner(provider);
+        if (!runner) {
+            this.failUnsupportedProvider(payload.sessionId, provider);
+            return;
+        }
+        if (!this.sessionProviders.has(payload.sessionId)) {
             if (!payload.projectPath || !payload.approvalMode) {
                 log.card("Missing session metadata", ["Open the session again after the app refreshes its data."], "warning");
                 this.bridge.send({
@@ -132,13 +191,25 @@ export class SessionManager {
                 sessionId: `${payload.sessionId.slice(0, 8)}...`,
                 sessionState: "resuming",
                 sessionDetail: "Reopening the selected conversation",
-                modelName: payload.modelName ?? "gpt-5.4",
+                providerName: providerLabel(provider),
+                modelName: payload.modelName ?? (provider === "qwen" ? "qwen-default" : "gpt-5.4"),
                 reasoning: payload.reasoningEffort ?? "medium",
                 approvalMode: payload.approvalMode,
             });
             log.clearInfoBar();
-            this.activeSessionId = payload.sessionId;
-            this.runner.resumeSession(payload.sessionId, payload.projectPath, payload.text, payload.modelName ?? "gpt-5.4", payload.reasoningEffort ?? "medium", payload.approvalMode, this.apiKey, payload.codexSessionId ?? null);
+            this.sessionProviders.set(payload.sessionId, provider);
+            this.sessionStatuses.set(payload.sessionId, "queued");
+            runner.resumeSession({
+                sessionId: payload.sessionId,
+                projectPath: payload.projectPath,
+                prompt: payload.text,
+                modelName: payload.modelName ?? (provider === "qwen" ? "qwen-default" : "gpt-5.4"),
+                reasoningEffort: payload.reasoningEffort ?? "medium",
+                approvalMode: payload.approvalMode,
+                planMode: provider === "qwen" ? false : (payload.planMode ?? false),
+                apiKey: provider === "codex" ? this.apiKey : undefined,
+                providerSessionId: payload.providerSessionId ?? (provider === "qwen" ? payload.sessionId : null),
+            });
             return;
         }
         const { sessionId, text } = payload;
@@ -146,7 +217,8 @@ export class SessionManager {
         const followUpDashboard = {
             sessionId: `${sessionId.slice(0, 8)}...`,
             sessionState: "running",
-            sessionDetail: "Sending a follow-up to Codex",
+            sessionDetail: `Sending a follow-up to ${providerLabel(provider)}`,
+            providerName: providerLabel(provider),
         };
         if (payload.modelName) {
             followUpDashboard.modelName = payload.modelName;
@@ -156,152 +228,224 @@ export class SessionManager {
         }
         log.setDashboard(followUpDashboard);
         log.clearInfoBar();
-        this.runner.inputToSession(sessionId, text, payload.modelName, payload.reasoningEffort);
+        runner.inputToSession(sessionId, text, payload.modelName, provider === "qwen" ? false : payload.planMode, payload.reasoningEffort, payload.approvalMode);
     }
     handleFinish(sessionId) {
-        if (sessionId !== this.activeSessionId)
+        if (!this.sessionProviders.has(sessionId))
             return;
         log.step("Finishing the current session");
-        this.runner.finishSession(sessionId);
+        this.finishProviderSession(sessionId);
     }
     wireRunnerEvents() {
-        this.runner.on("output", (sid, data) => {
-            this.bridge.send({
-                type: "session:output",
-                payload: { sessionId: sid, data, timestamp: Date.now() },
+        for (const [provider, runner] of Object.entries(this.runners)) {
+            if (!runner) {
+                continue;
+            }
+            runner.on("output", (sid, data) => {
+                this.bridge.send({
+                    type: "session:output",
+                    payload: { sessionId: sid, data, timestamp: Date.now() },
+                });
             });
-        });
-        this.runner.on("status", (sid, status) => {
-            if (status === "running") {
-                log.setDashboard({
-                    sessionId: `${sid.slice(0, 8)}...`,
-                    sessionState: "running",
-                    sessionDetail: "Codex is working on your request",
+            runner.on("status", (sid, status) => {
+                this.sessionStatuses.set(sid, status);
+                this.updateActiveSessionCount();
+                if (status === "running") {
+                    log.setDashboard({
+                        sessionId: `${sid.slice(0, 8)}...`,
+                        sessionState: "running",
+                        sessionDetail: `${providerLabel(provider)} is working on your request`,
+                        providerName: providerLabel(provider),
+                    });
+                    log.clearInfoBar();
+                    log.step("Session running");
+                }
+                else if (status === "idle") {
+                    log.setDashboard({
+                        sessionId: `${sid.slice(0, 8)}...`,
+                        sessionState: "idle",
+                        sessionDetail: "Waiting for a follow-up",
+                        providerName: providerLabel(provider),
+                    });
+                    log.clearInfoBar();
+                    log.ok("Session completed");
+                    log.step("Waiting for the next prompt");
+                }
+                else if (status === "busy") {
+                    log.setDashboard({
+                        sessionId: `${sid.slice(0, 8)}...`,
+                        sessionState: "approval",
+                        sessionDetail: "Waiting for approval",
+                        providerName: providerLabel(provider),
+                    });
+                    log.infoBar("Approval required to continue.", "warning");
+                    log.step("Approval required");
+                }
+                else if (status === "queued") {
+                    log.setDashboard({
+                        sessionId: `${sid.slice(0, 8)}...`,
+                        sessionState: "queued",
+                        sessionDetail: "Preparing the session",
+                        providerName: providerLabel(provider),
+                    });
+                    log.clearInfoBar();
+                    log.step("Preparing the session");
+                }
+                else if (status === "cancelled") {
+                    log.setDashboard({
+                        sessionId: "-",
+                        sessionState: "idle",
+                        sessionDetail: "Waiting for a remote session",
+                        providerName: "-",
+                    });
+                    log.clearInfoBar();
+                    log.ok("Session cancelled");
+                }
+                else if (status === "completed") {
+                    log.setDashboard({
+                        sessionId: "-",
+                        sessionState: "idle",
+                        sessionDetail: "Waiting for a remote session",
+                        providerName: "-",
+                    });
+                    log.clearInfoBar();
+                    log.ok("Session closed");
+                }
+                else if (status === "failed") {
+                    log.setDashboard({
+                        sessionId: `${sid.slice(0, 8)}...`,
+                        sessionState: "failed",
+                        sessionDetail: "The session failed",
+                        providerName: providerLabel(provider),
+                    });
+                    log.infoBar("Session failed. Review the error below.", "danger");
+                    log.error("Session failed");
+                }
+                else {
+                    log.debug(`Session ${sid} status -> ${status}`);
+                }
+                this.bridge.send({
+                    type: "session:status",
+                    payload: { sessionId: sid, status },
                 });
-                log.clearInfoBar();
-                log.step("Session running");
-            }
-            else if (status === "idle") {
-                log.setDashboard({
-                    sessionId: `${sid.slice(0, 8)}...`,
-                    sessionState: "idle",
-                    sessionDetail: "Waiting for a follow-up",
-                });
-                log.clearInfoBar();
-                log.ok("Session completed");
-                log.step("Waiting for the next prompt");
-            }
-            else if (status === "busy") {
+            });
+            runner.on("approval", (sid, requestId, title, message, options) => {
                 log.setDashboard({
                     sessionId: `${sid.slice(0, 8)}...`,
                     sessionState: "approval",
                     sessionDetail: "Waiting for approval",
+                    providerName: providerLabel(provider),
                 });
-                log.infoBar("Approval required to continue.", "warning");
-                log.step("Approval required");
-            }
-            else if (status === "queued") {
-                log.setDashboard({
-                    sessionId: `${sid.slice(0, 8)}...`,
-                    sessionState: "queued",
-                    sessionDetail: "Preparing the session",
+                this.bridge.send({
+                    type: "session:approval",
+                    payload: {
+                        sessionId: sid,
+                        requestId,
+                        title: title ?? undefined,
+                        provider,
+                        message,
+                        options: options.map((option) => ({
+                            label: option.label,
+                            index: option.index,
+                        })),
+                    },
                 });
-                log.clearInfoBar();
-                log.step("Preparing the session");
-            }
-            else if (status === "cancelled") {
-                log.setDashboard({
-                    sessionId: "-",
-                    sessionState: "idle",
-                    sessionDetail: "Waiting for a remote session",
-                });
-                log.clearInfoBar();
-                log.ok("Session cancelled");
-            }
-            else if (status === "completed") {
+            });
+            runner.on("complete", (sid, exitCode, duration) => {
+                const sec = (duration / 1000).toFixed(1);
+                const tracePath = this.sessionLogs.get(sid);
                 log.setDashboard({
                     sessionId: "-",
                     sessionState: "idle",
                     sessionDetail: "Waiting for a remote session",
+                    providerName: "-",
                 });
                 log.clearInfoBar();
-                log.ok("Session closed");
-            }
-            else if (status === "failed") {
+                log.summary("Session finished", [
+                    ["Session", `${sid.slice(0, 8)}...`],
+                    ["Provider", providerLabel(provider)],
+                    ["Exit code", String(exitCode)],
+                    ["Duration", `${sec}s`],
+                    ...(tracePath ? [["Log file", tracePath]] : []),
+                ]);
+                if (tracePath) {
+                    log.note(`Session log: ${tracePath}`, "info");
+                }
+                this.bridge.send({
+                    type: "session:complete",
+                    payload: { sessionId: sid, exitCode, duration },
+                });
+                this.sessionStatuses.delete(sid);
+                this.sessionProviders.delete(sid);
+                this.sessionLogs.delete(sid);
+                this.updateActiveSessionCount();
+                log.step("Waiting for a session");
+            });
+            runner.on("error", (sid, error) => {
                 log.setDashboard({
                     sessionId: `${sid.slice(0, 8)}...`,
                     sessionState: "failed",
                     sessionDetail: "The session failed",
+                    providerName: providerLabel(provider),
                 });
                 log.infoBar("Session failed. Review the error below.", "danger");
-                log.error("Session failed");
+                log.card("Session error", [error], "danger");
+                this.bridge.send({
+                    type: "session:error",
+                    payload: { sessionId: sid, error },
+                });
+            });
+            runner.on("providerSession", (sid, providerSessionId) => {
+                log.debug(`Session ${sid.slice(0, 8)}... ${provider} session -> ${providerSessionId}`);
+                this.bridge.send({
+                    type: "session:meta",
+                    payload: { sessionId: sid, providerSessionId },
+                });
+            });
+            runner.on("sessionLog", (sid, tracePath) => {
+                this.sessionLogs.set(sid, tracePath);
+                log.debug(`Session ${sid.slice(0, 8)}... log -> ${tracePath}`);
+            });
+        }
+    }
+    getRunner(provider) {
+        return this.runners[provider] ?? null;
+    }
+    getRunnerForSession(sessionId) {
+        const provider = this.sessionProviders.get(sessionId);
+        if (!provider) {
+            return null;
+        }
+        return this.getRunner(provider);
+    }
+    finishProviderSession(sessionId) {
+        const runner = this.getRunnerForSession(sessionId);
+        runner?.finishSession(sessionId);
+    }
+    hasBusySessions() {
+        for (const status of this.sessionStatuses.values()) {
+            if (status === "queued" || status === "running" || status === "busy") {
+                return true;
             }
-            else {
-                log.debug(`Session ${sid} status -> ${status}`);
-            }
-            this.bridge.send({
-                type: "session:status",
-                payload: { sessionId: sid, status },
-            });
+        }
+        return false;
+    }
+    failUnsupportedProvider(sessionId, provider) {
+        const label = providerLabel(provider);
+        log.card(`${label} CLI not found`, [`Install it before starting a ${label} session.`], "danger");
+        this.bridge.send({
+            type: "session:error",
+            payload: {
+                sessionId,
+                error: `${label} CLI is not available on this machine`,
+            },
         });
-        this.runner.on("approval", (sid, message, options) => {
-            log.setDashboard({
-                sessionId: `${sid.slice(0, 8)}...`,
-                sessionState: "approval",
-                sessionDetail: "Waiting for approval",
-            });
-            // Approval card is only sent to the remote app, not displayed in CLI
-            this.bridge.send({
-                type: "session:approval",
-                payload: {
-                    sessionId: sid,
-                    message,
-                    options: options.map((option) => ({
-                        label: option.label,
-                        index: option.index,
-                    })),
-                },
-            });
-        });
-        this.runner.on("complete", (sid, exitCode, duration) => {
-            const sec = (duration / 1000).toFixed(1);
-            log.setDashboard({
-                sessionId: "-",
-                sessionState: "idle",
-                sessionDetail: "Waiting for a remote session",
-            });
-            log.clearInfoBar();
-            log.summary("Session finished", [
-                ["Session", `${sid.slice(0, 8)}...`],
-                ["Exit code", String(exitCode)],
-                ["Duration", `${sec}s`],
-            ]);
-            this.bridge.send({
-                type: "session:complete",
-                payload: { sessionId: sid, exitCode, duration },
-            });
-            this.activeSessionId = null;
-            log.step("Waiting for a session");
-        });
-        this.runner.on("error", (sid, error) => {
-            log.setDashboard({
-                sessionId: `${sid.slice(0, 8)}...`,
-                sessionState: "failed",
-                sessionDetail: "The session failed",
-            });
-            log.infoBar("Session failed. Review the error below.", "danger");
-            log.card("Session error", [error], "danger");
-            this.bridge.send({
-                type: "session:error",
-                payload: { sessionId: sid, error },
-            });
-        });
-        this.runner.on("codexSession", (sid, codexSessionId) => {
-            log.debug(`Session ${sid.slice(0, 8)}... codex session -> ${codexSessionId}`);
-            this.bridge.send({
-                type: "session:meta",
-                payload: { sessionId: sid, codexSessionId },
-            });
+        this.bridge.send({
+            type: "session:status",
+            payload: {
+                sessionId,
+                status: "failed",
+            },
         });
     }
 }

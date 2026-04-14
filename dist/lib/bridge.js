@@ -21,6 +21,7 @@ function machineTopic(machineId) {
 export class Bridge extends EventEmitter {
     config;
     machineToken;
+    supportedProviders;
     client = null;
     machineChannel = null;
     heartbeatTimer = null;
@@ -32,10 +33,11 @@ export class Bridge extends EventEmitter {
     machineAccessTokenExpiresAt = 0;
     machineState = "idle";
     sessions = new Map();
-    constructor(config, machineToken) {
+    constructor(config, machineToken, supportedProviders) {
         super();
         this.config = config;
         this.machineToken = machineToken;
+        this.supportedProviders = supportedProviders;
     }
     on(event, fn) {
         return super.on(event, fn);
@@ -151,7 +153,7 @@ export class Bridge extends EventEmitter {
                 return;
             case "session:status":
                 this.getSessionState(msg.payload.sessionId).lastStatus = msg.payload.status;
-                this.machineState = this.deriveMachineState(msg.payload.status);
+                this.machineState = this.recomputeMachineState();
                 {
                     const state = this.getSessionState(msg.payload.sessionId);
                     const readableBlock = makeReadableStatusBlock(state.readableSeq++, msg.payload.status, nowIso());
@@ -184,9 +186,10 @@ export class Bridge extends EventEmitter {
                 }
                 return;
             case "session:busy":
-                this.machineState = "busy";
                 {
                     const state = this.getSessionState(msg.payload.sessionId);
+                    state.lastStatus = "busy";
+                    this.machineState = this.recomputeMachineState();
                     const occurredAt = nowIso();
                     const readableBlock = makeReadableStatusBlock(state.readableSeq++, "busy", occurredAt, "Machine occupee");
                     await this.ingest(msg.payload.sessionId, {
@@ -203,14 +206,15 @@ export class Bridge extends EventEmitter {
             case "session:meta":
                 await this.ingest(msg.payload.sessionId, {
                     sessionPatch: {
-                        codexSessionId: msg.payload.codexSessionId,
+                        providerSessionId: msg.payload.providerSessionId,
                     },
                 });
                 return;
             case "session:complete": {
                 const state = this.getSessionState(msg.payload.sessionId);
                 const finalStatus = state.lastStatus ?? (msg.payload.exitCode === 0 ? "completed" : "failed");
-                this.machineState = "idle";
+                state.lastStatus = finalStatus;
+                this.machineState = this.recomputeMachineState();
                 const occurredAt = nowIso();
                 const readableBlock = makeReadableStatusBlock(state.readableSeq++, finalStatus, occurredAt, `exit=${msg.payload.exitCode}, duration=${msg.payload.duration}ms`);
                 await this.ingest(msg.payload.sessionId, {
@@ -225,6 +229,7 @@ export class Bridge extends EventEmitter {
                     machineState: this.machineState,
                 });
                 this.sessions.delete(msg.payload.sessionId);
+                this.machineState = this.recomputeMachineState();
                 return;
             }
             default:
@@ -319,20 +324,15 @@ export class Bridge extends EventEmitter {
             occurredAt: nowIso(),
         };
     }
-    deriveMachineState(status) {
-        switch (status) {
-            case "running":
+    recomputeMachineState() {
+        for (const state of this.sessions.values()) {
+            if (state.lastStatus === "queued" ||
+                state.lastStatus === "running" ||
+                state.lastStatus === "busy") {
                 return "busy";
-            case "busy":
-                return "busy";
-            case "completed":
-            case "failed":
-            case "cancelled":
-            case "idle":
-                return "idle";
-            default:
-                return this.machineState;
+            }
         }
+        return "idle";
     }
     async ingest(sessionId, payload) {
         const accessToken = await this.ensureMachineAccessToken();
@@ -371,6 +371,7 @@ export class Bridge extends EventEmitter {
                 availabilityState: state ?? this.machineState,
                 heartbeatGraceMs: OFFLINE_GRACE_MS,
                 cliVersion: this.config.cliVersion,
+                supportedProviders: this.supportedProviders,
             }),
         });
         if (!response.ok) {

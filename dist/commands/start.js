@@ -1,7 +1,7 @@
 import { log } from "../lib/logger.js";
 import { loadConfig, updateConfig } from "../lib/config.js";
 import { getAuthToken } from "../lib/credentials.js";
-import { checkCodexCli } from "../lib/checks.js";
+import { getSupportedProviders } from "../lib/checks.js";
 import { Bridge } from "../lib/bridge.js";
 import { SessionManager } from "../lib/session.js";
 export async function startCommand() {
@@ -22,10 +22,13 @@ export async function startCommand() {
         log.card("You're not logged in", ["Run openremote login."], "danger");
         process.exit(1);
     }
-    const codex = checkCodexCli();
-    if (!codex.ok) {
+    const supportedProviders = getSupportedProviders();
+    if (supportedProviders.length === 0) {
         log.header("OpenRemote");
-        log.card("Codex CLI not found", ["Install it with: npm install -g @openai/codex"], "danger");
+        log.card("No supported CLI found", [
+            "Install Codex with: npm install -g @openai/codex",
+            "Or install Qwen with: npm install -g @alibaba-cloud/qwen-cli",
+        ], "danger");
         process.exit(1);
     }
     log.setDashboard({
@@ -35,6 +38,7 @@ export async function startCommand() {
         sessionId: "-",
         sessionState: "idle",
         sessionDetail: "Waiting for a remote session",
+        providerName: "-",
         modelName: "-",
         reasoning: "-",
         approvalMode: "-",
@@ -47,8 +51,8 @@ export async function startCommand() {
     log.header("OpenRemote");
     log.step("Connecting to your machine");
     const apiKey = process.env.OPENAI_API_KEY || "";
-    const bridge = new Bridge(config, machineToken);
-    const sessions = new SessionManager(bridge, apiKey);
+    const bridge = new Bridge(config, machineToken, supportedProviders);
+    const sessions = new SessionManager(bridge, apiKey, supportedProviders);
     bridge.on("connected", () => {
         updateConfig({ lastSeenAt: new Date().toISOString() });
         log.setDashboard({
