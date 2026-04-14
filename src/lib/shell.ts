@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
@@ -50,4 +51,29 @@ export function getShellLaunch(): { shell: string; argsForCommand: (command: str
     shell,
     argsForCommand: (command) => ["-l", "-c", command],
   };
+}
+
+export function resolveExecutable(command: string): string | null {
+  if (process.platform === "win32") {
+    return command;
+  }
+
+  try {
+    const shell = getShellLaunch();
+    const result = spawnSync(
+      shell.shell,
+      shell.argsForCommand(`command -v -- ${command.replace(/[^\w.-]/g, "")}`),
+      {
+        encoding: "utf-8",
+        timeout: 10_000,
+      },
+    );
+    if (result.status !== 0) {
+      return null;
+    }
+    const resolved = `${result.stdout ?? ""}`.trim().split(/\r?\n/).at(-1)?.trim() ?? "";
+    return resolved || null;
+  } catch {
+    return null;
+  }
 }

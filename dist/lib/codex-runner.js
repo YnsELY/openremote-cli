@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import * as pty from "node-pty";
 import { findCodexSessionIdForProject } from "./codex-session-store.js";
 import { log } from "./logger.js";
+import { resolveExecutable } from "./shell.js";
 function ts() {
     return `[${new Date().toISOString()}] [runner]`;
 }
@@ -277,16 +278,33 @@ export class CodexRunner extends EventEmitter {
         const args = this.buildArgs(prompt, entry.modelName, entry.reasoningEffort, entry.approvalMode, resume, providerSessionIdOrLast(entry.providerSessionId), !requiresModeHandshake);
         log.debug(`${ts()} session ${entry.id} - codex ${args.join(" ")}`);
         log.debug(`${ts()} cwd: ${entry.projectPath}`);
+        const isWin = process.platform === "win32";
+        const resolvedCodex = isWin ? null : resolveExecutable("codex");
         this.writeTrace(entry, "launch", {
             resume,
             desiredPlanMode: entry.desiredPlanMode,
             includePrompt: !requiresModeHandshake,
             args,
             cwd: entry.projectPath,
+            resolvedExecutable: resolvedCodex,
         });
-        const isWin = process.platform === "win32";
-        const shell = isWin ? "cmd.exe" : "codex";
+        const shell = isWin ? "cmd.exe" : resolvedCodex ?? "codex";
         const shellArgs = isWin ? ["/c", "codex", ...args] : args;
+        if (!isWin && !resolvedCodex) {
+            const detail = "Failed to launch Codex PTY because the codex binary could not be resolved from the login shell PATH.";
+            this.writeTrace(entry, "launch-error", {
+                shell,
+                shellArgs,
+                cwd: entry.projectPath,
+                message: detail,
+            });
+            this.emit("error", entry.id, detail);
+            this.emit("status", entry.id, "failed");
+            this.emit("complete", entry.id, 1, Date.now() - entry.startedAt);
+            this.closeTrace(entry);
+            this.sessions.delete(entry.id);
+            return;
+        }
         let processPty;
         try {
             processPty = pty.spawn(shell, shellArgs, {

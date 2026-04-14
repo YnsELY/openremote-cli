@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import * as pty from "node-pty";
 import { log } from "./logger.js";
+import { resolveExecutable } from "./shell.js";
 function ts() {
     return `[${new Date().toISOString()}] [qwen-runner]`;
 }
@@ -284,15 +285,32 @@ export class QwenRunner extends EventEmitter {
         const args = this.buildArgs(prompt, entry.approvalMode, resume, entry.providerSessionId);
         log.debug(`${ts()} session ${entry.id} - qwen ${args.join(" ")}`);
         log.debug(`${ts()} cwd: ${entry.projectPath}`);
+        const isWin = process.platform === "win32";
+        const resolvedQwen = isWin ? null : resolveExecutable("qwen");
         this.writeTrace(entry, "launch", {
             resume,
             args,
             cwd: entry.projectPath,
             providerSessionId: entry.providerSessionId,
+            resolvedExecutable: resolvedQwen,
         });
-        const isWin = process.platform === "win32";
-        const shell = isWin ? "cmd.exe" : "qwen";
+        const shell = isWin ? "cmd.exe" : resolvedQwen ?? "qwen";
         const shellArgs = isWin ? ["/c", "qwen", ...args] : args;
+        if (!isWin && !resolvedQwen) {
+            const detail = "Failed to launch Qwen PTY because the qwen binary could not be resolved from the login shell PATH.";
+            this.writeTrace(entry, "launch-error", {
+                shell,
+                shellArgs,
+                cwd: entry.projectPath,
+                message: detail,
+            });
+            this.emit("error", entry.id, detail);
+            this.emit("status", entry.id, "failed");
+            this.emit("complete", entry.id, 1, Date.now() - entry.startedAt);
+            this.closeTrace(entry);
+            this.sessions.delete(entry.id);
+            return;
+        }
         let processPty;
         try {
             processPty = pty.spawn(shell, shellArgs, {
