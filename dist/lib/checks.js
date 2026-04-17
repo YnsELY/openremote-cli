@@ -82,6 +82,9 @@ export function getSupportedProviders() {
     if (checkQwenCli().ok) {
         supported.push("qwen");
     }
+    if (checkClaudeCodeCli().ok) {
+        supported.push("claude");
+    }
     return supported;
 }
 export function checkConfig() {

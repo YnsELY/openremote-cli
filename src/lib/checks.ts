@@ -93,6 +93,9 @@ export function getSupportedProviders(): AgentProvider[] {
   if (checkQwenCli().ok) {
     supported.push("qwen");
   }
+  if (checkClaudeCodeCli().ok) {
+    supported.push("claude");
+  }
   return supported;
 }
 

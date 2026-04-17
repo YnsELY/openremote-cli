@@ -10,6 +10,7 @@ export interface ProviderSessionOptions {
     apiKey?: string;
     providerSessionId?: string | null;
     timeoutMs?: number;
+    attachments?: string[];
 }
 export interface ProviderRunner {
     readonly provider: AgentProvider;
@@ -20,7 +21,7 @@ export interface ProviderRunner {
         ok: boolean;
         error?: string;
     };
-    inputToSession(sessionId: string, text: string, modelName?: string, planMode?: boolean, reasoningEffort?: string, approvalMode?: "full-auto" | "auto-edit" | "suggest"): boolean;
+    inputToSession(sessionId: string, text: string, modelName?: string, planMode?: boolean, reasoningEffort?: string, approvalMode?: "full-auto" | "auto-edit" | "suggest", attachments?: string[]): boolean;
     cancelSession(sessionId: string): boolean;
     finishSession(sessionId: string): boolean;
     killAll(): void;

@@ -186,7 +186,7 @@ export class QwenRunner extends EventEmitter {
         log.debug(`${ts()} respondToSession: cleared pendingOptions, returning true`);
         return { ok: true };
     }
-    inputToSession(sessionId, text, modelName, _planMode, reasoningEffort, approvalMode) {
+    inputToSession(sessionId, text, modelName, _planMode, reasoningEffort, approvalMode, _attachments) {
         const entry = this.sessions.get(sessionId);
         if (!entry) {
             return false;

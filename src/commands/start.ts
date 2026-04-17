@@ -62,7 +62,7 @@ export async function startCommand(): Promise<void> {
 
   const apiKey = process.env.OPENAI_API_KEY || "";
   const bridge = new Bridge(config, machineToken, supportedProviders);
-  const sessions = new SessionManager(bridge, apiKey, supportedProviders);
+  const sessions = new SessionManager(bridge, apiKey, supportedProviders, config);
 
   bridge.on("connected", () => {
     updateConfig({ lastSeenAt: new Date().toISOString() });

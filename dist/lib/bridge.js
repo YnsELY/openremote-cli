@@ -77,6 +77,9 @@ export class Bridge extends EventEmitter {
     get isConnected() {
         return this.machineChannel?.state === "joined";
     }
+    registerSessionProvider(sessionId, provider) {
+        this.getSessionState(sessionId).provider = provider;
+    }
     async openConnection() {
         try {
             const accessToken = await this.ensureMachineAccessToken();
@@ -151,6 +154,21 @@ export class Bridge extends EventEmitter {
             case "session:output":
                 this.bufferOutput(msg.payload.sessionId, msg.payload.data, msg.payload.timestamp);
                 return;
+            case "session:block": {
+                const state = this.getSessionState(msg.payload.sessionId);
+                await this.ingest(msg.payload.sessionId, {
+                    readableBlocks: [
+                        {
+                            ...msg.payload.block,
+                            seq: typeof msg.payload.block.seq === "number"
+                                ? msg.payload.block.seq
+                                : state.readableSeq++,
+                            occurredAt: msg.payload.block.occurredAt ?? nowIso(),
+                        },
+                    ],
+                });
+                return;
+            }
             case "session:status":
                 this.getSessionState(msg.payload.sessionId).lastStatus = msg.payload.status;
                 this.machineState = this.recomputeMachineState();
@@ -241,6 +259,7 @@ export class Bridge extends EventEmitter {
         if (existing)
             return existing;
         const created = {
+            provider: null,
             eventSeq: 1,
             outputSeq: 1,
             readableSeq: 1,
@@ -293,8 +312,11 @@ export class Bridge extends EventEmitter {
         state.output.text = "";
         state.output.byteCount = 0;
         const { blocks: readableBlocks, remainder } = deriveReadableBlocksFromChunk(`${state.readableRemainder}${outputText}`, state.readableSeq, occurredAt, { final });
-        state.readableRemainder = remainder;
-        state.readableSeq += readableBlocks.length;
+        const shouldDeriveReadableBlocks = state.provider !== "codex" && state.provider !== "claude";
+        state.readableRemainder = shouldDeriveReadableBlocks ? remainder : "";
+        if (shouldDeriveReadableBlocks) {
+            state.readableSeq += readableBlocks.length;
+        }
         const outputSegments = outputText.length > 0
             ? [
                 {
@@ -307,7 +329,7 @@ export class Bridge extends EventEmitter {
             : [];
         await this.ingest(sessionId, {
             outputSegments,
-            readableBlocks,
+            readableBlocks: shouldDeriveReadableBlocks ? readableBlocks : [],
         });
     }
     async flushAllOutputs() {

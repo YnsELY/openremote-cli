@@ -9,7 +9,7 @@ export interface AppConfig {
     backendUrl?: string;
 }
 export type MachineAvailabilityState = "offline" | "idle" | "busy" | "revoked";
-export type AgentProvider = "codex" | "qwen";
+export type AgentProvider = "codex" | "qwen" | "claude";
 export type SessionStatus = "queued" | "running" | "busy" | "idle" | "completed" | "failed" | "cancelled";
 export interface ParsedOption {
     index: number;
@@ -86,7 +86,17 @@ export interface SessionMetaMsg {
         providerSessionId: string;
     };
 }
-export type OutboundMessage = MachineHelloMsg | MachineOfflineMsg | SessionOutputMsg | SessionStatusMsg | SessionApprovalMsg | SessionCompleteMsg | SessionErrorMsg | SessionBusyMsg | SessionMetaMsg;
+export interface SessionReadableBlockMsg {
+    type: "session:block";
+    payload: {
+        sessionId: string;
+        block: Omit<SessionReadableBlockIngest, "seq" | "occurredAt"> & {
+            seq?: number;
+            occurredAt?: string;
+        };
+    };
+}
+export type OutboundMessage = MachineHelloMsg | MachineOfflineMsg | SessionOutputMsg | SessionStatusMsg | SessionApprovalMsg | SessionCompleteMsg | SessionErrorMsg | SessionBusyMsg | SessionMetaMsg | SessionReadableBlockMsg;
 export interface MachineReadyMsg {
     type: "machine:ready";
     payload: Record<string, never>;
@@ -103,7 +113,12 @@ export interface SessionStartMsg {
         approvalMode: "full-auto" | "auto-edit" | "suggest";
         planMode: boolean;
         forceReplace?: boolean;
+        attachments?: AttachmentRef[];
     };
+}
+export interface AttachmentRef {
+    url: string;
+    name: string;
 }
 export interface SessionCancelMsg {
     type: "session:cancel";
@@ -132,6 +147,7 @@ export interface SessionInputMsg {
         approvalMode?: "full-auto" | "auto-edit" | "suggest";
         providerSessionId?: string | null;
         forceReplace?: boolean;
+        attachments?: AttachmentRef[];
     };
 }
 export interface SessionFinishMsg {
@@ -172,6 +188,10 @@ export interface SessionPatch {
 }
 export interface RunnerEvents {
     output: (sessionId: string, data: string) => void;
+    readableBlock: (sessionId: string, block: Omit<SessionReadableBlockIngest, "seq" | "occurredAt"> & {
+        seq?: number;
+        occurredAt?: string;
+    }) => void;
     error: (sessionId: string, error: string) => void;
     status: (sessionId: string, status: SessionStatus) => void;
     complete: (sessionId: string, exitCode: number, duration: number) => void;

@@ -11,6 +11,7 @@ export interface ProviderSessionOptions {
   apiKey?: string;
   providerSessionId?: string | null;
   timeoutMs?: number;
+  attachments?: string[];
 }
 
 export interface ProviderRunner {
@@ -30,6 +31,7 @@ export interface ProviderRunner {
     planMode?: boolean,
     reasoningEffort?: string,
     approvalMode?: "full-auto" | "auto-edit" | "suggest",
+    attachments?: string[],
   ): boolean;
   cancelSession(sessionId: string): boolean;
   finishSession(sessionId: string): boolean;

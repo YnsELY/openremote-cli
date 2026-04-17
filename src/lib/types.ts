@@ -17,7 +17,7 @@ export type MachineAvailabilityState =
   | "busy"
   | "revoked";
 
-export type AgentProvider = "codex" | "qwen";
+export type AgentProvider = "codex" | "qwen" | "claude";
 
 // Codex session
 
@@ -91,6 +91,17 @@ export interface SessionMetaMsg {
   payload: { sessionId: string; providerSessionId: string };
 }
 
+export interface SessionReadableBlockMsg {
+  type: "session:block";
+  payload: {
+    sessionId: string;
+    block: Omit<SessionReadableBlockIngest, "seq" | "occurredAt"> & {
+      seq?: number;
+      occurredAt?: string;
+    };
+  };
+}
+
 export type OutboundMessage =
   | MachineHelloMsg
   | MachineOfflineMsg
@@ -100,7 +111,8 @@ export type OutboundMessage =
   | SessionCompleteMsg
   | SessionErrorMsg
   | SessionBusyMsg
-  | SessionMetaMsg;
+  | SessionMetaMsg
+  | SessionReadableBlockMsg;
 
 // Backend -> CLI
 export interface MachineReadyMsg {
@@ -120,7 +132,13 @@ export interface SessionStartMsg {
     approvalMode: "full-auto" | "auto-edit" | "suggest";
     planMode: boolean;
     forceReplace?: boolean;
+    attachments?: AttachmentRef[];
   };
+}
+
+export interface AttachmentRef {
+  url: string;
+  name: string;
 }
 
 export interface SessionCancelMsg {
@@ -146,6 +164,7 @@ export interface SessionInputMsg {
     approvalMode?: "full-auto" | "auto-edit" | "suggest";
     providerSessionId?: string | null;
     forceReplace?: boolean;
+    attachments?: AttachmentRef[];
   };
 }
 
@@ -210,6 +229,13 @@ export interface SessionPatch {
 
 export interface RunnerEvents {
   output: (sessionId: string, data: string) => void;
+  readableBlock: (
+    sessionId: string,
+    block: Omit<SessionReadableBlockIngest, "seq" | "occurredAt"> & {
+      seq?: number;
+      occurredAt?: string;
+    },
+  ) => void;
   error: (sessionId: string, error: string) => void;
   status: (sessionId: string, status: SessionStatus) => void;
   complete: (sessionId: string, exitCode: number, duration: number) => void;

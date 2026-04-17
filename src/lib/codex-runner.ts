@@ -1,41 +1,24 @@
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
 import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import * as pty from "node-pty";
 import { findCodexSessionIdForProject } from "./codex-session-store.js";
+import { CodexAppServerClient } from "./codex-app-server-client.js";
 import { log } from "./logger.js";
 import type { ProviderRunner, ProviderSessionOptions } from "./provider-runner.js";
-import { buildShellCommand, getShellLaunch, resolveExecutable } from "./shell.js";
-import type { ParsedOption, RunnerEvents, SessionStatus } from "./types.js";
+import type {
+  ParsedOption,
+  RunnerEvents,
+  SessionReadableBlockIngest,
+  SessionStatus,
+} from "./types.js";
 
-function ts() {
-  return `[${new Date().toISOString()}] [runner]`;
+type JsonRpcId = string | number;
+
+interface PendingApproval {
+  options: ParsedOption[];
+  respond: (optionIndex: number) => Promise<void>;
 }
-
-function sanitizePtyEnv(extra: Record<string, string>): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === "string") {
-      env[key] = value;
-    }
-  }
-  for (const [key, value] of Object.entries(extra)) {
-    env[key] = value;
-  }
-  return env;
-}
-
-type CliMode = "default" | "plan";
-type StartupPhase = "launching" | "waiting_mode_banner" | "toggling_mode" | "ready" | "failed";
-
-const MODE_HANDSHAKE_TIMEOUT_MS = 8_000;
-const IDLE_OUTPUT_TIMEOUT_MS = 15_000;
-const MAX_MODE_SWITCH_ATTEMPTS = 2;
-const SHIFT_TAB = "\x1b[Z";
 
 interface SessionEntry {
   id: string;
@@ -47,36 +30,131 @@ interface SessionEntry {
   planMode: boolean;
   status: SessionStatus;
   startedAt: number;
-  exitCode: number | null;
   apiKey: string;
-  pty: pty.IPty | null;
-  timeout: ReturnType<typeof setTimeout> | null;
-  pendingOptions: ParsedOption[];
-  pendingRequestId: string | null;
-  idleCompletionTimer: ReturnType<typeof setTimeout> | null;
-  launchId: number;
   providerSessionId: string | null;
-  discoveryTimer: ReturnType<typeof setInterval> | null;
-  awaitingApproval: boolean;
-  lastApprovalSignature: string | null;
-  requestCounter: number;
-  desiredPlanMode: boolean;
-  confirmedCliMode: CliMode | null;
-  pendingPrompt: string | null;
-  startupPhase: StartupPhase;
-  modeSwitchAttempts: number;
-  modeHandshakeTimer: ReturnType<typeof setTimeout> | null;
-  modeFailureStatus: SessionStatus | null;
-  terminateOnModeFailure: boolean;
+  activeTurnId: string | null;
+  timeout: ReturnType<typeof setTimeout> | null;
+  pendingApprovals: Map<string, PendingApproval>;
+  seenDeltaItems: Set<string>;
+  reasoningActive: boolean;
+  commandRunning: number;
+  pendingDiff: string | null;
+  lastEmittedDiff: string | null;
   ptyTracePath: string | null;
   ptyTraceStream: WriteStream | null;
-  mirrorWindowOpened: boolean;
-  submitTimer: ReturnType<typeof setTimeout> | null;
+}
+
+type AppServerNotification = Record<string, unknown> | undefined;
+
+function ts(): string {
+  return `[${new Date().toISOString()}] [runner]`;
+}
+
+function stringifyError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function summarizeCommandFailure(output: string | null, exitCode: number | null): string {
+  const firstMeaningfulLine = (output ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0 && !/^exit code:/i.test(line) && !/^wall time:/i.test(line));
+
+  const base =
+    typeof exitCode === "number"
+      ? `Une commande a échoué (exit code ${exitCode}).`
+      : "Une commande a échoué.";
+
+  if (!firstMeaningfulLine) {
+    return base;
+  }
+
+  return `${base} ${firstMeaningfulLine}`.slice(0, 320);
+}
+
+function buildTextInput(text: string): Array<Record<string, unknown>> {
+  return [
+    {
+      type: "text",
+      text,
+      text_elements: [],
+    },
+  ];
+}
+
+function mapApprovalPolicy(
+  approvalMode: "full-auto" | "auto-edit" | "suggest",
+): "on-request" {
+  void approvalMode;
+  return "on-request";
+}
+
+function mapSandboxMode(
+  approvalMode: "full-auto" | "auto-edit" | "suggest",
+): "workspace-write" | undefined {
+  return approvalMode === "full-auto" || approvalMode === "auto-edit"
+    ? "workspace-write"
+    : undefined;
+}
+
+function buildThreadConfig(entry: SessionEntry): Record<string, unknown> {
+  const config: Record<string, unknown> = {
+    cwd: entry.projectPath,
+    model: entry.modelName,
+    approvalPolicy: mapApprovalPolicy(entry.approvalMode),
+    experimentalRawEvents: true,
+    persistExtendedHistory: true,
+  };
+
+  const sandbox = mapSandboxMode(entry.approvalMode);
+  if (sandbox) {
+    config.sandbox = sandbox;
+  }
+
+  return config;
+}
+
+function buildTurnConfig(entry: SessionEntry): Record<string, unknown> {
+  return {
+    threadId: entry.providerSessionId,
+    input: buildTextInput(entry.prompt),
+    model: entry.modelName,
+    effort: entry.reasoningEffort,
+    approvalPolicy: mapApprovalPolicy(entry.approvalMode),
+  };
 }
 
 export class CodexRunner extends EventEmitter implements ProviderRunner {
   readonly provider = "codex" as const;
-  private sessions = new Map<string, SessionEntry>();
+
+  private readonly client = new CodexAppServerClient();
+  private readonly sessions = new Map<string, SessionEntry>();
+  private readonly sessionByThreadId = new Map<string, string>();
+
+  constructor() {
+    super();
+    this.client.on("notification", (method, params) => {
+      this.handleNotification(method, params);
+    });
+    this.client.on("serverRequest", (id, method, params) => {
+      this.handleServerRequest(id, method, params);
+    });
+    this.client.on("closed", (reason) => {
+      this.handleClientClosed(reason);
+    });
+  }
 
   override on<K extends keyof RunnerEvents>(event: K, fn: RunnerEvents[K]): this {
     return super.on(event, fn);
@@ -90,120 +168,17 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
   }
 
   startSession(options: ProviderSessionOptions): void {
-    const {
-      sessionId,
-      projectPath,
-      prompt,
-      modelName,
-      reasoningEffort,
-      approvalMode,
-      planMode,
-      apiKey = "",
-      providerSessionId = null,
-      timeoutMs = 0,
-    } = options;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    if (timeoutMs > 0) {
-      timer = setTimeout(() => {
-        log.debug(`${ts()} session ${sessionId} timed out`);
-        this.cancelSession(sessionId);
-      }, timeoutMs);
-    }
-
-    const entry: SessionEntry = {
-      id: sessionId,
-      prompt,
-      modelName,
-      reasoningEffort,
-      projectPath,
-      approvalMode,
-      planMode,
-      status: "queued",
-      startedAt: Date.now(),
-      exitCode: null,
-      apiKey,
-      pty: null,
-      timeout: timer,
-      pendingOptions: [],
-      pendingRequestId: null,
-      idleCompletionTimer: null,
-      launchId: 0,
-      providerSessionId,
-      discoveryTimer: null,
-      awaitingApproval: false,
-      lastApprovalSignature: null,
-      requestCounter: 0,
-      desiredPlanMode: planMode,
-      confirmedCliMode: null,
-      pendingPrompt: null,
-      startupPhase: "ready",
-      modeSwitchAttempts: 0,
-      modeHandshakeTimer: null,
-      modeFailureStatus: null,
-      terminateOnModeFailure: false,
-      ptyTracePath: null,
-      ptyTraceStream: null,
-      mirrorWindowOpened: false,
-      submitTimer: null,
-    };
-
+    const entry = this.createSessionEntry(options, "queued");
     this.ensureTrace(entry);
-    this.sessions.set(sessionId, entry);
-    this.launchProcess(entry, prompt, false);
+    this.sessions.set(entry.id, entry);
+    void this.openThread(entry, false);
   }
 
   resumeSession(options: ProviderSessionOptions): void {
-    const {
-      sessionId,
-      projectPath,
-      prompt,
-      modelName,
-      reasoningEffort,
-      approvalMode,
-      planMode,
-      apiKey = "",
-      providerSessionId = null,
-    } = options;
-    const entry: SessionEntry = {
-      id: sessionId,
-      prompt,
-      modelName,
-      reasoningEffort,
-      projectPath,
-      approvalMode,
-      planMode,
-      status: "idle",
-      startedAt: Date.now(),
-      exitCode: null,
-      apiKey,
-      pty: null,
-      timeout: null,
-      pendingOptions: [],
-      pendingRequestId: null,
-      idleCompletionTimer: null,
-      launchId: 0,
-      providerSessionId,
-      discoveryTimer: null,
-      awaitingApproval: false,
-      lastApprovalSignature: null,
-      requestCounter: 0,
-      desiredPlanMode: planMode,
-      confirmedCliMode: null,
-      pendingPrompt: null,
-      startupPhase: "ready",
-      modeSwitchAttempts: 0,
-      modeHandshakeTimer: null,
-      modeFailureStatus: null,
-      terminateOnModeFailure: false,
-      ptyTracePath: null,
-      ptyTraceStream: null,
-      mirrorWindowOpened: false,
-      submitTimer: null,
-    };
-
+    const entry = this.createSessionEntry(options, "queued");
     this.ensureTrace(entry);
-    this.sessions.set(sessionId, entry);
-    this.launchProcess(entry, prompt, true);
+    this.sessions.set(entry.id, entry);
+    void this.openThread(entry, true);
   }
 
   respondToSession(
@@ -212,59 +187,49 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
     optionIndex: number,
   ): { ok: boolean; error?: string } {
     const entry = this.sessions.get(sessionId);
-    if (!entry || !entry.pty) {
+    if (!entry) {
       return {
         ok: false,
         error: "Approval could not be resolved because the session is no longer active.",
       };
     }
 
-    if (!entry.awaitingApproval || !entry.pendingRequestId) {
+    const pending = entry.pendingApprovals.get(requestId);
+    if (!pending) {
       return {
         ok: false,
         error: "Approval could not be resolved because there is no pending request.",
       };
     }
 
-    if (entry.pendingRequestId !== requestId) {
-      return {
-        ok: false,
-        error: "Approval could not be resolved because a newer request replaced it.",
-      };
-    }
-
-    const option = entry.pendingOptions[optionIndex];
-    if (!option && optionIndex >= entry.pendingOptions.length) {
+    const option = pending.options[optionIndex];
+    if (!option) {
       return {
         ok: false,
         error: "Approval could not be resolved because the selected option is invalid.",
       };
     }
 
-    if (entry.idleCompletionTimer) {
-      clearTimeout(entry.idleCompletionTimer);
-      entry.idleCompletionTimer = null;
-    }
+    entry.pendingApprovals.delete(requestId);
+    this.writeTrace(entry, "approval-response", {
+      requestId,
+      optionIndex,
+      label: option.label,
+    });
+    void pending
+      .respond(optionIndex)
+      .then(() => {
+        if (this.sessions.has(sessionId) && entry.pendingApprovals.size === 0) {
+          this.setStatus(entry, "running");
+        }
+      })
+      .catch((error) => {
+        this.handleTurnFailure(
+          entry,
+          `Failed to respond to Codex approval request: ${stringifyError(error)}`,
+        );
+      });
 
-    if (option?.shortcutKey) {
-      const key = option.shortcutKey === "esc" ? "\x1b" : option.shortcutKey;
-      entry.pty.write(key);
-    } else {
-      for (let i = 0; i < 10; i += 1) {
-        entry.pty.write("\x1b[A");
-      }
-      for (let i = 0; i < optionIndex; i += 1) {
-        entry.pty.write("\x1b[B");
-      }
-      entry.pty.write("\r");
-    }
-
-    entry.pendingOptions = [];
-    entry.pendingRequestId = null;
-    entry.awaitingApproval = false;
-    entry.lastApprovalSignature = null;
-    entry.status = "running";
-    this.emit("status", sessionId, "running");
     return { ok: true };
   }
 
@@ -275,25 +240,28 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
     planMode?: boolean,
     reasoningEffort?: string,
     approvalMode?: "full-auto" | "auto-edit" | "suggest",
+    _attachments?: string[],
   ): boolean {
     const entry = this.sessions.get(sessionId);
-    if (!entry) {
+    if (!entry || !entry.providerSessionId) {
       return false;
     }
 
-    if (entry.idleCompletionTimer) {
-      clearTimeout(entry.idleCompletionTimer);
-      entry.idleCompletionTimer = null;
+    if (entry.activeTurnId || entry.status === "running" || entry.status === "busy") {
+      this.emit(
+        "error",
+        sessionId,
+        "Codex is already working on this session. Wait for the current turn to finish.",
+      );
+      return false;
     }
 
-    const previousDesiredPlanMode = entry.desiredPlanMode;
-
+    entry.prompt = text;
     if (modelName) {
       entry.modelName = modelName;
     }
     if (typeof planMode === "boolean") {
       entry.planMode = planMode;
-      entry.desiredPlanMode = planMode;
     }
     if (reasoningEffort) {
       entry.reasoningEffort = reasoningEffort;
@@ -302,28 +270,10 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       entry.approvalMode = approvalMode;
     }
 
-    if (entry.status === "idle") {
-      this.launchProcess(entry, text, true);
-      return true;
-    }
-
-    if (!entry.pty) {
-      return false;
-    }
-
-    entry.prompt = text;
-    const planModeChanged = previousDesiredPlanMode !== entry.desiredPlanMode;
-    if (this.modeMatchesTarget(entry.confirmedCliMode, entry.desiredPlanMode)) {
-      this.submitPrompt(entry, text, "direct-input");
-      return true;
-    }
-
-    if (!planModeChanged && !entry.desiredPlanMode && entry.confirmedCliMode === null) {
-      this.submitPrompt(entry, text, "direct-input-inferred-default");
-      return true;
-    }
-
-    this.beginModeHandshake(entry, text, entry.status, false, false);
+    entry.pendingApprovals.clear();
+    entry.seenDeltaItems.clear();
+    this.setStatus(entry, "running");
+    void this.startTurn(entry);
     return true;
   }
 
@@ -333,24 +283,27 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       return false;
     }
 
-    entry.status = "cancelled";
-    this.emit("status", sessionId, "cancelled");
-    this.clearRuntimeTimers(entry);
+    this.writeTrace(entry, "session-cancel-requested", {
+      activeTurnId: entry.activeTurnId,
+      providerSessionId: entry.providerSessionId,
+    });
 
-    if (!entry.pty) {
-      const duration = Date.now() - entry.startedAt;
-      this.emit("complete", sessionId, 130, duration);
-      this.closeTrace(entry);
-      this.sessions.delete(sessionId);
-      return true;
+    const activeTurnId = entry.activeTurnId;
+    entry.activeTurnId = null;
+    if (entry.providerSessionId && activeTurnId) {
+      void this.client
+        .request("turn/interrupt", {
+          threadId: entry.providerSessionId,
+          turnId: activeTurnId,
+        })
+        .catch((error) => {
+          log.debug(
+            `${ts()} session ${sessionId} - interrupt failed: ${stringifyError(error)}`,
+          );
+        });
     }
 
-    try {
-      entry.pty.kill();
-    } catch {
-      // Process may have already exited.
-    }
-
+    this.finalizeSession(entry, "cancelled", 130);
     return true;
   }
 
@@ -360,822 +313,793 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       return false;
     }
 
-    this.clearRuntimeTimers(entry);
-    entry.pendingOptions = [];
-    entry.pendingRequestId = null;
-    entry.awaitingApproval = false;
-    entry.lastApprovalSignature = null;
-    entry.status = "completed";
-    this.emit("status", sessionId, "completed");
+    this.writeTrace(entry, "session-finish-requested", {
+      providerSessionId: entry.providerSessionId,
+    });
 
-    const duration = Date.now() - entry.startedAt;
-
-    if (entry.pty) {
-      const processPty = entry.pty;
-      entry.pty = null;
-      try {
-        processPty.kill();
-      } catch {
-        // Process may already have exited.
-      }
+    if (entry.providerSessionId) {
+      void this.client
+        .request("thread/unsubscribe", {
+          threadId: entry.providerSessionId,
+        })
+        .catch((error) => {
+          log.debug(
+            `${ts()} session ${sessionId} - unsubscribe failed: ${stringifyError(error)}`,
+          );
+        });
     }
 
-    this.closeTrace(entry);
-    this.emit("complete", sessionId, 0, duration);
-    this.sessions.delete(sessionId);
+    this.finalizeSession(entry, "completed", 0);
     return true;
   }
 
-  hasActiveSession(): boolean {
-    return this.sessions.size > 0;
-  }
-
-  getActiveSessionId(): string | null {
-    const first = this.sessions.keys().next();
-    return first.done ? null : first.value;
-  }
-
   killAll(): void {
-    for (const [id] of this.sessions) {
-      this.cancelSession(id);
+    for (const [sessionId] of this.sessions) {
+      this.cancelSession(sessionId);
+    }
+    if (this.sessions.size === 0) {
+      void this.client.stop();
     }
   }
 
-  private launchProcess(entry: SessionEntry, prompt: string, resume: boolean): void {
-    const requiresModeHandshake = entry.desiredPlanMode;
-    const args = this.buildArgs(
-      prompt,
-      entry.modelName,
-      entry.reasoningEffort,
-      entry.approvalMode,
-      resume,
-      providerSessionIdOrLast(entry.providerSessionId),
-      !requiresModeHandshake,
-    );
-    log.debug(`${ts()} session ${entry.id} - codex ${args.join(" ")}`);
-    log.debug(`${ts()} cwd: ${entry.projectPath}`);
-    const isWin = process.platform === "win32";
-    const resolvedCodex = isWin ? null : resolveExecutable("codex");
-    if (!existsSync(entry.projectPath)) {
-      const detail = `Failed to launch Codex PTY because the working directory does not exist: ${entry.projectPath}`;
-      entry.status = "failed";
-      this.writeTrace(entry, "launch-error", {
-        shell: null,
-        shellArgs: null,
-        cwd: entry.projectPath,
-        message: detail,
-      });
-      this.emit("error", entry.id, detail);
-      this.emit("status", entry.id, "failed");
-      this.emit("complete", entry.id, 1, Date.now() - entry.startedAt);
-      this.closeTrace(entry);
-      this.sessions.delete(entry.id);
-      return;
-    }
-    this.writeTrace(entry, "launch", {
-      resume,
-      desiredPlanMode: entry.desiredPlanMode,
-      includePrompt: !requiresModeHandshake,
-      args,
-      cwd: entry.projectPath,
-      resolvedExecutable: resolvedCodex,
-    });
+  private createSessionEntry(
+    options: ProviderSessionOptions,
+    status: SessionStatus,
+  ): SessionEntry {
+    const timeout =
+      options.timeoutMs && options.timeoutMs > 0
+        ? setTimeout(() => {
+            this.cancelSession(options.sessionId);
+          }, options.timeoutMs)
+        : null;
 
-    const unixCommand = `exec ${buildShellCommand("codex", args)}`;
-    const unixShell = getShellLaunch();
-    const shell = isWin ? "cmd.exe" : unixShell.shell;
-    const shellArgs = isWin ? ["/c", "codex", ...args] : unixShell.argsForCommand(unixCommand);
-
-    if (!isWin && !resolvedCodex) {
-      const detail =
-        "Failed to launch Codex PTY because the codex binary could not be resolved from the login shell PATH.";
-      entry.status = "failed";
-      this.writeTrace(entry, "launch-error", {
-        shell,
-        shellArgs,
-        cwd: entry.projectPath,
-        message: detail,
-      });
-      this.emit("error", entry.id, detail);
-      this.emit("status", entry.id, "failed");
-      this.emit("complete", entry.id, 1, Date.now() - entry.startedAt);
-      this.closeTrace(entry);
-      this.sessions.delete(entry.id);
-      return;
-    }
-
-    let processPty: pty.IPty;
-    try {
-      processPty = pty.spawn(shell, shellArgs, {
-        name: "xterm-256color",
-        cols: 120,
-        rows: 40,
-        cwd: entry.projectPath,
-        env: sanitizePtyEnv({ OPENAI_API_KEY: entry.apiKey }),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const detail =
-        `Failed to launch Codex PTY (shell=${shell}, cwd=${entry.projectPath}). ${message}`;
-      entry.status = "failed";
-      this.writeTrace(entry, "launch-error", { shell, shellArgs, cwd: entry.projectPath, message });
-      this.emit("error", entry.id, detail);
-      this.emit("status", entry.id, "failed");
-      this.emit("complete", entry.id, 1, Date.now() - entry.startedAt);
-      this.closeTrace(entry);
-      this.sessions.delete(entry.id);
-      return;
-    }
-
-    entry.launchId += 1;
-    const launchId = entry.launchId;
-    entry.pty = processPty;
-    entry.pendingOptions = [];
-    entry.pendingRequestId = null;
-    entry.awaitingApproval = false;
-    entry.lastApprovalSignature = null;
-    entry.prompt = prompt;
-    entry.confirmedCliMode = null;
-    entry.status = "running";
-    this.emit("status", entry.id, "running");
-    this.beginCodexSessionDiscovery(entry, resume);
-
-    if (requiresModeHandshake) {
-      this.beginModeHandshake(entry, prompt, resume ? "idle" : "failed", !resume, true);
-    } else {
-      entry.pendingPrompt = null;
-      entry.startupPhase = "ready";
-      entry.modeFailureStatus = null;
-      entry.terminateOnModeFailure = false;
-    }
-
-    let buffer = "";
-
-    processPty.onData((data: string) => {
-      const current = this.sessions.get(entry.id);
-      if (!current || current.launchId !== launchId || current.pty !== processPty) {
-        return;
-      }
-
-      this.emit("output", entry.id, data);
-      this.writeTrace(entry, "pty-output", { data });
-
-      const lower = data.toLowerCase();
-      if (lower.includes("trust") && lower.includes("directory")) {
-        log.debug(`${ts()} auto-accepting trust prompt`);
-        this.writeTrace(current, "pty-input", { text: "y", reason: "trust-directory" });
-        processPty.write("y\r");
-        return;
-      }
-
-      if (data.includes("\x1b[2J") || data.includes("\x1b[H\x1b[2J")) {
-        buffer = "";
-      }
-
-      buffer += data;
-      if (buffer.length > 8192) {
-        buffer = buffer.slice(-8192);
-      }
-
-      const clean = this.stripAnsi(buffer);
-      if (
-        current.startupPhase === "waiting_mode_banner" &&
-        this.detectCliReady(clean)
-      ) {
-        this.writeTrace(current, "cli-ready", {
-          desiredPlanMode: current.desiredPlanMode,
-          startupPhase: current.startupPhase,
-        });
-        current.startupPhase = "toggling_mode";
-        this.sendShiftTab(current);
-        this.startModeHandshakeTimer(current);
-      }
-
-      const detectedMode = this.detectCliMode(clean);
-      if (detectedMode) {
-        this.writeTrace(current, "mode-banner", { mode: detectedMode });
-        this.handleDetectedMode(current, detectedMode);
-      }
-
-      const parsed = this.parsePrompt(clean);
-      if (parsed) {
-        this.raiseApproval(current, parsed);
-        buffer = "";
-      }
-
-      if (current.idleCompletionTimer) {
-        clearTimeout(current.idleCompletionTimer);
-        current.idleCompletionTimer = null;
-      }
-      if (current.discoveryTimer) {
-        clearInterval(current.discoveryTimer);
-        current.discoveryTimer = null;
-      }
-
-      if (Date.now() - current.startedAt > IDLE_OUTPUT_TIMEOUT_MS) {
-        current.idleCompletionTimer = setTimeout(() => {
-          const latest = this.sessions.get(entry.id);
-          if (
-            !latest ||
-            latest.launchId !== launchId ||
-            latest.pty !== processPty ||
-            latest.status !== "running" ||
-            latest.awaitingApproval ||
-            latest.startupPhase !== "ready"
-          ) {
-            return;
-          }
-
-          log.debug(`${ts()} session ${entry.id} - no PTY output for 15s, marking idle`);
-          latest.status = "idle";
-          latest.pendingOptions = [];
-          latest.pendingRequestId = null;
-          latest.awaitingApproval = false;
-          latest.lastApprovalSignature = null;
-          latest.pty = null;
-          this.emit("status", entry.id, "idle");
-
-          try {
-            processPty.kill();
-          } catch {
-            // Process may already have exited.
-          }
-        }, IDLE_OUTPUT_TIMEOUT_MS);
-      }
-    });
-
-    processPty.onExit(({ exitCode }) => {
-      log.debug(`${ts()} session ${entry.id} exited code=${exitCode}`);
-      const current = this.sessions.get(entry.id);
-      if (!current) {
-        return;
-      }
-
-      if (current.launchId !== launchId || current.pty !== processPty) {
-        return;
-      }
-
-      current.pty = null;
-      current.pendingOptions = [];
-      current.pendingRequestId = null;
-      current.awaitingApproval = false;
-      current.lastApprovalSignature = null;
-      if (current.idleCompletionTimer) {
-        clearTimeout(current.idleCompletionTimer);
-        current.idleCompletionTimer = null;
-      }
-      if (current.modeHandshakeTimer) {
-        clearTimeout(current.modeHandshakeTimer);
-        current.modeHandshakeTimer = null;
-      }
-
-      const duration = Date.now() - current.startedAt;
-      current.exitCode = exitCode;
-
-      if (current.status === "cancelled") {
-        if (current.timeout) {
-          clearTimeout(current.timeout);
-          current.timeout = null;
-        }
-        this.emit("complete", entry.id, exitCode, duration);
-        this.closeTrace(current);
-        this.sessions.delete(entry.id);
-        return;
-      }
-
-      if (exitCode === 0) {
-        current.status = "idle";
-        current.startupPhase = "ready";
-        this.emit("status", entry.id, "idle");
-        return;
-      }
-
-      if (current.timeout) {
-        clearTimeout(current.timeout);
-        current.timeout = null;
-      }
-
-      current.status = "failed";
-      current.startupPhase = "failed";
-      this.emit("status", entry.id, "failed");
-      this.emit("complete", entry.id, exitCode, duration);
-      this.closeTrace(current);
-      this.sessions.delete(entry.id);
-    });
-  }
-
-  private buildArgs(
-    prompt: string,
-    modelName: string,
-    reasoningEffort: string,
-    mode: "full-auto" | "auto-edit" | "suggest",
-    resume: boolean,
-    resumeTarget: string,
-    includePrompt: boolean,
-  ): string[] {
-    const args: string[] = [];
-
-    if (resume) {
-      args.push("exec", "resume");
-      args.push(resumeTarget);
-      args.push("-c", `model="${modelName}"`);
-      args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
-      if (mode === "full-auto" || mode === "auto-edit") {
-        args.push("--full-auto");
-      }
-      if (includePrompt && prompt.trim()) {
-        args.push(prompt);
-      }
-      return args;
-    }
-
-    args.push("-c", `model="${modelName}"`);
-    args.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
-    if (mode === "full-auto" || mode === "auto-edit") {
-      args.push("--full-auto");
-    }
-    if (includePrompt && prompt.trim()) {
-      args.push(prompt);
-    }
-    return args;
-  }
-
-  private beginModeHandshake(
-    entry: SessionEntry,
-    prompt: string,
-    failureStatus: SessionStatus | null,
-    terminateOnFailure: boolean,
-    waitForInitialBanner: boolean,
-  ): void {
-    entry.pendingPrompt = prompt;
-    entry.startupPhase = waitForInitialBanner ? "waiting_mode_banner" : "toggling_mode";
-    entry.modeFailureStatus = failureStatus;
-    entry.terminateOnModeFailure = terminateOnFailure;
-    entry.modeSwitchAttempts = 0;
-    entry.pendingOptions = [];
-    entry.pendingRequestId = null;
-    entry.awaitingApproval = false;
-    entry.lastApprovalSignature = null;
-
-    if (!waitForInitialBanner && entry.pty) {
-      this.sendShiftTab(entry);
-    }
-
-    this.writeTrace(entry, "mode-handshake-start", {
-      prompt,
-      fallbackStatus: entry.modeFailureStatus,
-      terminateOnFailure: entry.terminateOnModeFailure,
-      waitForInitialBanner,
-      initialShiftTabSent: Boolean(entry.pty),
-      desiredPlanMode: entry.desiredPlanMode,
-    });
-    this.startModeHandshakeTimer(entry);
-  }
-
-  private startModeHandshakeTimer(entry: SessionEntry): void {
-    if (entry.modeHandshakeTimer) {
-      clearTimeout(entry.modeHandshakeTimer);
-    }
-    entry.modeHandshakeTimer = setTimeout(() => {
-      const current = this.sessions.get(entry.id);
-      if (!current || current !== entry) {
-        return;
-      }
-      this.failModeHandshake(
-        current,
-        "Plan mode could not be confirmed in Codex CLI. No prompt was sent.",
-      );
-    }, MODE_HANDSHAKE_TIMEOUT_MS);
-  }
-
-  private handleDetectedMode(entry: SessionEntry, mode: CliMode): void {
-    const previousMode = entry.confirmedCliMode;
-    entry.confirmedCliMode = mode;
-    this.writeTrace(entry, "mode-detected", {
-      mode,
-      previousMode,
-      startupPhase: entry.startupPhase,
-      desiredMode: this.desiredCliMode(entry.desiredPlanMode),
-    });
-
-    if (entry.startupPhase === "ready" || entry.startupPhase === "failed") {
-      return;
-    }
-
-    const desiredMode = this.desiredCliMode(entry.desiredPlanMode);
-    if (mode === desiredMode) {
-      this.completeModeHandshake(entry);
-      return;
-    }
-
-    if (
-      entry.startupPhase === "toggling_mode" &&
-      previousMode === mode
-    ) {
-      return;
-    }
-
-    if (entry.modeSwitchAttempts >= MAX_MODE_SWITCH_ATTEMPTS) {
-      this.failModeHandshake(
-        entry,
-        "Plan mode could not be confirmed in Codex CLI. No prompt was sent.",
-      );
-      return;
-    }
-
-    if (!entry.pty) {
-      this.failModeHandshake(
-        entry,
-        "Plan mode could not be confirmed in Codex CLI because the session closed before the prompt was sent.",
-      );
-      return;
-    }
-
-    entry.startupPhase = "toggling_mode";
-    this.sendShiftTab(entry);
-    this.startModeHandshakeTimer(entry);
-  }
-
-  private completeModeHandshake(entry: SessionEntry): void {
-    if (entry.modeHandshakeTimer) {
-      clearTimeout(entry.modeHandshakeTimer);
-      entry.modeHandshakeTimer = null;
-    }
-
-    const prompt = entry.pendingPrompt;
-    entry.pendingPrompt = null;
-    entry.startupPhase = "ready";
-    entry.modeFailureStatus = null;
-    entry.terminateOnModeFailure = false;
-
-    if (prompt && entry.pty) {
-      this.submitPrompt(entry, prompt, "mode-handshake-complete");
-    }
-  }
-
-  private failModeHandshake(entry: SessionEntry, message: string): void {
-    const finalMessage = entry.ptyTracePath ? `${message} PTY trace: ${entry.ptyTracePath}` : message;
-    log.debug(`${ts()} session ${entry.id} - ${finalMessage}`);
-    if (entry.modeHandshakeTimer) {
-      clearTimeout(entry.modeHandshakeTimer);
-      entry.modeHandshakeTimer = null;
-    }
-
-    entry.pendingPrompt = null;
-    entry.startupPhase = "failed";
-    entry.pendingOptions = [];
-    entry.pendingRequestId = null;
-    entry.awaitingApproval = false;
-    entry.lastApprovalSignature = null;
-    this.writeTrace(entry, "mode-handshake-failed", {
-      message,
-      fallbackStatus: entry.modeFailureStatus,
-      terminate: entry.terminateOnModeFailure,
-    });
-    this.emit("error", entry.id, finalMessage);
-
-    const fallbackStatus = entry.modeFailureStatus;
-    const terminate = entry.terminateOnModeFailure;
-    const processPty = entry.pty;
-    entry.pty = null;
-    entry.modeFailureStatus = null;
-    entry.terminateOnModeFailure = false;
-
-    if (processPty) {
-      try {
-        processPty.kill();
-      } catch {
-        // Process may already have exited.
-      }
-    }
-
-    if (terminate) {
-      if (entry.timeout) {
-        clearTimeout(entry.timeout);
-        entry.timeout = null;
-      }
-      entry.status = "failed";
-      this.emit("status", entry.id, "failed");
-      this.emit("complete", entry.id, 1, Date.now() - entry.startedAt);
-      this.closeTrace(entry);
-      this.sessions.delete(entry.id);
-      return;
-    }
-
-    if (fallbackStatus && entry.status !== fallbackStatus) {
-      entry.status = fallbackStatus;
-      this.emit("status", entry.id, fallbackStatus);
-      if (fallbackStatus === "idle") {
-        entry.startupPhase = "ready";
-      }
-    }
-  }
-
-  private sendShiftTab(entry: SessionEntry): void {
-    if (!entry.pty) {
-      return;
-    }
-    entry.modeSwitchAttempts += 1;
-    log.debug(`${ts()} session ${entry.id} - sending Shift+Tab attempt ${entry.modeSwitchAttempts}`);
-    this.writeTrace(entry, "pty-input", {
-      text: SHIFT_TAB,
-      label: "Shift+Tab",
-      attempt: entry.modeSwitchAttempts,
-    });
-    entry.pty.write(SHIFT_TAB);
-  }
-
-  private desiredCliMode(planMode: boolean): CliMode {
-    return planMode ? "plan" : "default";
-  }
-
-  private modeMatchesTarget(mode: CliMode | null, planMode: boolean): boolean {
-    return mode === this.desiredCliMode(planMode);
-  }
-
-  private detectCliMode(text: string): CliMode | null {
-    const match = text.match(/\b(plan|default)\s+mode\s*\(shift\+tab to cycle\)/i);
-    if (!match) {
-      return null;
-    }
-    return match[1].toLowerCase() === "plan" ? "plan" : "default";
-  }
-
-  private detectCliReady(text: string): boolean {
-    return (
-      /OpenAI Codex/i.test(text) &&
-      /model:\s+/i.test(text) &&
-      /directory:\s+/i.test(text) &&
-      /(^|\n)\s*[›>]\s+/m.test(text)
-    );
-  }
-
-  private parsePrompt(text: string): { contextText: string; options: ParsedOption[] } | null {
-    const lines = text
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n")
-      .split("\n")
-      .slice(-80)
-      .map((line) => line.trimEnd());
-    const optionMatcher =
-      /^(?:\s*(?:\u203a|\u276f|>|->|\*)\s*)?(\d+)[.)]\s+(.+?)(?:\s+\(([\w-]+)\))?\s*$/;
-    const hasCursorPrefix = (line: string) =>
-      /^\s*(?:\u203a|\u276f|>|->|\*)\s*/.test(line);
-    const isDescriptionLine = (line: string) => {
-      const trimmed = line.trim();
-      if (!trimmed || optionMatcher.test(trimmed)) {
-        return false;
-      }
-      return (
-        /^\s{2,}\S/.test(line) ||
-        /^[a-z]/.test(trimmed) ||
-        /\b(recommended|default|faster|safer|impact|tradeoff)\b/i.test(trimmed)
-      );
-    };
-    let blockStart = -1;
-    let blockHasCursor = false;
-    let blockOptions: ParsedOption[] = [];
-    let bestStart = -1;
-    let bestEnd = -1;
-    let bestHasCursor = false;
-    let bestOptions: ParsedOption[] = [];
-    const commitBlock = (endExclusive: number) => {
-      if (blockOptions.length >= 2) {
-        bestStart = blockStart;
-        bestEnd = endExclusive - 1;
-        bestHasCursor = blockHasCursor;
-        bestOptions = [...blockOptions];
-      }
-      blockStart = -1;
-      blockHasCursor = false;
-      blockOptions = [];
-    };
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index];
-      const match = line.match(optionMatcher);
-      if (!match) {
-        if (blockOptions.length > 0 && isDescriptionLine(line)) {
-          continue;
-        }
-        if (blockOptions.length > 0) {
-          commitBlock(index);
-        }
-        continue;
-      }
-      const optionNumber = Number(match[1]);
-      const label = match[2].trim();
-      const shortcutKey = match[3] ?? null;
-      const hasCursor = hasCursorPrefix(line);
-      if (!label) {
-        if (blockOptions.length > 0) {
-          commitBlock(index);
-        }
-        continue;
-      }
-      if (blockOptions.length === 0) {
-        if (optionNumber !== 1) {
-          continue;
-        }
-        blockStart = index;
-        blockHasCursor = hasCursor;
-        blockOptions.push({
-          index: 0,
-          label,
-          shortcutKey,
-        });
-        continue;
-      }
-      const expectedNumber = blockOptions.length + 1;
-      if (optionNumber !== expectedNumber) {
-        commitBlock(index);
-        if (optionNumber !== 1) {
-          continue;
-        }
-        blockStart = index;
-        blockHasCursor = hasCursor;
-        blockOptions.push({
-          index: 0,
-          label,
-          shortcutKey,
-        });
-        continue;
-      }
-      blockHasCursor ||= hasCursor;
-      blockOptions.push({
-        index: blockOptions.length,
-        label,
-        shortcutKey,
-      });
-    }
-    if (blockOptions.length > 0) {
-      commitBlock(lines.length);
-    }
-    if (bestOptions.length < 2 || bestStart === -1 || bestEnd === -1) {
-      return null;
-    }
-    const contextLines: string[] = [];
-    for (let index = bestStart - 1; index >= 0; index -= 1) {
-      const line = lines[index].trim();
-      if (!line) {
-        if (contextLines.length > 0) {
-          break;
-        }
-        continue;
-      }
-      contextLines.unshift(line);
-      if (contextLines.length >= 8) {
-        break;
-      }
-    }
-    const contextText = contextLines.join("\n").trim();
-    const region = lines
-      .slice(Math.max(0, bestStart - 8), bestEnd + 1)
-      .join("\n")
-      .trim();
-    const lastContextLine = contextLines.at(-1) ?? "";
-    const looksInteractive =
-      bestHasCursor ||
-      bestOptions.some((option) => option.shortcutKey) ||
-      /[?]\s*$/.test(lastContextLine) ||
-      /\b(recommended|select one|choose one|pick one|press enter to submit|esc to cancel|answer the following|question)\b/i.test(
-        `${contextText}\n${region}`,
-      ) ||
-      /\b(choose|pick|select|which|prefer|option|recommended|continue|confirm|allow|approve|answer|respond|question|what should i|would you like|how should i|autoriser|choisir|quelle option|quel choix|continuer|confirmer|repondre|r??pondre)\b/i.test(
-        `${contextText}\n${region}`,
-      );
-    if (!looksInteractive) {
-      return null;
-    }
     return {
-      contextText: contextText || region,
-      options: bestOptions,
+      id: options.sessionId,
+      prompt: options.prompt,
+      modelName: options.modelName,
+      reasoningEffort: options.reasoningEffort,
+      projectPath: options.projectPath,
+      approvalMode: options.approvalMode,
+      planMode: options.planMode,
+      status,
+      startedAt: Date.now(),
+      apiKey: options.apiKey ?? "",
+      providerSessionId: options.providerSessionId ?? null,
+      activeTurnId: null,
+      timeout,
+      pendingApprovals: new Map<string, PendingApproval>(),
+      seenDeltaItems: new Set<string>(),
+      reasoningActive: false,
+      commandRunning: 0,
+      pendingDiff: null,
+      lastEmittedDiff: null,
+      ptyTracePath: null,
+      ptyTraceStream: null,
     };
   }
 
-  private raiseApproval(
-    entry: SessionEntry,
-    parsed: { contextText: string; options: ParsedOption[] },
-  ): void {
-    const { title, message } = this.extractApprovalTextParts(parsed.contextText);
-    const signature = `${title ?? ""}::${message}::${parsed.options
-      .map((option) => `${option.index}:${option.label}:${option.shortcutKey ?? ""}`)
-      .join("|")}`;
+  private async openThread(entry: SessionEntry, resume: boolean): Promise<void> {
+    this.writeTrace(entry, "app-server-bootstrap", {
+      resume,
+      providerSessionId: entry.providerSessionId,
+      projectPath: entry.projectPath,
+      model: entry.modelName,
+      reasoningEffort: entry.reasoningEffort,
+      approvalMode: entry.approvalMode,
+      planMode: entry.planMode,
+    });
 
-    if (entry.awaitingApproval && entry.lastApprovalSignature === signature) {
+    try {
+      await this.client.ensureReady(entry.apiKey);
+
+      let threadId = entry.providerSessionId;
+      if (resume && !threadId) {
+        threadId = findCodexSessionIdForProject(entry.projectPath, entry.startedAt);
+        if (threadId) {
+          entry.providerSessionId = threadId;
+          this.writeTrace(entry, "provider-session-discovered", { providerSessionId: threadId });
+        }
+      }
+
+      const method = resume ? "thread/resume" : "thread/start";
+      const params = resume
+        ? {
+            threadId,
+            ...buildThreadConfig(entry),
+            persistExtendedHistory: true,
+          }
+        : buildThreadConfig(entry);
+
+      this.writeTrace(entry, "jsonrpc-request", { method, params });
+      const response = await this.client.request<Record<string, unknown>>(method, params);
+      this.writeTrace(entry, "jsonrpc-response", { method, response });
+
+      const thread = isRecord(response.thread) ? response.thread : null;
+      const providerSessionId = thread ? asString(thread.id) : null;
+      if (!providerSessionId) {
+        throw new Error(`Codex ${method} did not return a thread id.`);
+      }
+
+      entry.providerSessionId = providerSessionId;
+      this.sessionByThreadId.set(providerSessionId, entry.id);
+      this.emit("providerSession", entry.id, providerSessionId);
+
+      if (entry.prompt.trim()) {
+        this.setStatus(entry, "running");
+        await this.startTurn(entry);
+        return;
+      }
+
+      this.setStatus(entry, "idle");
+    } catch (error) {
+      this.finalizeWithError(
+        entry,
+        `Failed to ${resume ? "resume" : "start"} Codex session: ${stringifyError(error)}`,
+      );
+    }
+  }
+
+  private async startTurn(entry: SessionEntry): Promise<void> {
+    if (!entry.providerSessionId) {
+      this.handleTurnFailure(entry, "Missing Codex thread id for this session.");
       return;
     }
 
-    log.debug(`${ts()} interactive prompt detected (${parsed.options.length} opts)`);
-    entry.requestCounter += 1;
-    entry.pendingOptions = parsed.options;
-    entry.pendingRequestId = `${entry.id}-approval-${entry.requestCounter}`;
-    entry.awaitingApproval = true;
-    entry.lastApprovalSignature = signature;
-    entry.status = "busy";
-    this.emit("status", entry.id, "busy");
+    try {
+      this.setReasoningActive(entry, false);
+      entry.commandRunning = 0;
+      entry.pendingDiff = null;
+      const method = "turn/start";
+      const params = buildTurnConfig(entry);
+      this.writeTrace(entry, "jsonrpc-request", { method, params });
+      const response = await this.client.request<Record<string, unknown>>(method, params);
+      this.writeTrace(entry, "jsonrpc-response", { method, response });
+
+      const turn = isRecord(response.turn) ? response.turn : null;
+      const turnId = turn ? asString(turn.id) : null;
+      if (turnId) {
+        entry.activeTurnId = turnId;
+      }
+    } catch (error) {
+      this.handleTurnFailure(
+        entry,
+        `Failed to start a Codex turn: ${stringifyError(error)}`,
+      );
+    }
+  }
+
+  private handleNotification(method: string, params: AppServerNotification): void {
+    const threadId = params ? asString(params.threadId) : null;
+    const entry = threadId ? this.getSessionByThreadId(threadId) : null;
+    if (entry) {
+      this.writeTrace(entry, "notification", { method, params: params ?? null });
+    }
+
+    switch (method) {
+      case "turn/started": {
+        if (!entry || !params) return;
+        const turn = isRecord(params.turn) ? params.turn : null;
+        const turnId = turn ? asString(turn.id) : null;
+        if (turnId) {
+          entry.activeTurnId = turnId;
+        }
+        this.setStatus(entry, "running");
+        return;
+      }
+
+      case "thread/status/changed": {
+        if (!entry || !params) return;
+        const status = isRecord(params.status) ? asString(params.status.type) : null;
+        if (status === "active") {
+          if (entry.pendingApprovals.size === 0) {
+            this.setStatus(entry, "running");
+          }
+          return;
+        }
+        if (status === "idle") {
+          entry.activeTurnId = null;
+          if (entry.pendingApprovals.size === 0) {
+            this.setStatus(entry, "idle");
+          }
+        }
+        return;
+      }
+
+      case "turn/diff/updated": {
+        if (!entry || !params) return;
+        const diff = asString(params.diff);
+        if (diff) {
+          entry.pendingDiff = diff;
+        }
+        return;
+      }
+
+      case "item/started": {
+        if (!entry || !params) return;
+        const item = isRecord(params.item) ? params.item : null;
+        const itemType = item ? asString(item.type) : null;
+        if (!itemType) {
+          return;
+        }
+
+        if (itemType === "reasoning") {
+          this.setReasoningActive(entry, true);
+          return;
+        }
+
+        if (itemType === "commandExecution") {
+          this.setCommandRunning(entry, true);
+        }
+        return;
+      }
+
+      case "item/agentMessage/delta":
+      case "item/commandExecution/outputDelta":
+      case "item/fileChange/outputDelta": {
+        if (!entry || !params) return;
+        const itemId = asString(params.itemId);
+        const delta = asString(params.delta);
+        if (!delta) {
+          return;
+        }
+        if (itemId) {
+          entry.seenDeltaItems.add(itemId);
+        }
+        this.emit("output", entry.id, delta);
+        return;
+      }
+
+      case "rawResponseItem/completed": {
+        if (!entry || !params) return;
+        const item = isRecord(params.item) ? params.item : null;
+        if (!item) {
+          return;
+        }
+
+        const itemType = asString(item.type);
+        if (!itemType) {
+          return;
+        }
+
+        if (itemType === "reasoning") {
+          this.setReasoningActive(entry, false);
+          return;
+        }
+
+        if (itemType !== "message") {
+          return;
+        }
+
+        const role = asString(item.role);
+        const phase = asString(item.phase);
+        if (role !== "assistant" || phase !== "final_answer") {
+          return;
+        }
+
+        const content = Array.isArray(item.content) ? item.content : [];
+        const text = content
+          .filter((part) => isRecord(part) && part.type === "output_text" && typeof part.text === "string")
+          .map((part) => String(part.text))
+          .join("")
+          .trim();
+
+        if (!text) {
+          return;
+        }
+
+        this.clearTransientStates(entry);
+        this.emitReadableBlock(entry, {
+          kind: "text",
+          body: text,
+          metadata: {
+            phase: "final_answer",
+          },
+        });
+        return;
+      }
+
+      case "item/completed": {
+        if (!entry || !params) return;
+        const item = isRecord(params.item) ? params.item : null;
+        if (!item) {
+          return;
+        }
+        const itemId = asString(item.id);
+        const itemType = asString(item.type);
+        if (!itemId || !itemType || entry.seenDeltaItems.has(itemId)) {
+          return;
+        }
+
+        if (itemType === "agentMessage") {
+          const text = asString(item.text);
+          if (text) {
+            this.emit("output", entry.id, text);
+          }
+          return;
+        }
+
+        if (itemType === "commandExecution") {
+          this.setCommandRunning(entry, false);
+          const output = asString(item.aggregatedOutput);
+          if (output) {
+            this.emit("output", entry.id, output);
+          }
+          const exitCode = asNumber(item.exitCode);
+          if (exitCode !== null && exitCode !== 0) {
+            this.emitReadableBlock(entry, {
+              kind: "error",
+              title: "Erreur",
+              body: summarizeCommandFailure(output, exitCode),
+              metadata: {
+                source: "command",
+                summary: summarizeCommandFailure(output, exitCode),
+                exitCode,
+              },
+            });
+          }
+          return;
+        }
+
+        if (itemType === "reasoning") {
+          this.setReasoningActive(entry, false);
+          return;
+        }
+
+        if (itemType === "plan") {
+          const text = asString(item.text);
+          if (text) {
+            this.emit("output", entry.id, text);
+          }
+        }
+        return;
+      }
+
+      case "turn/completed": {
+        if (!entry || !params) return;
+        const turn = isRecord(params.turn) ? params.turn : null;
+        if (!turn) {
+          return;
+        }
+
+        const completedTurnId = asString(turn.id);
+        if (completedTurnId && entry.activeTurnId === completedTurnId) {
+          entry.activeTurnId = null;
+        }
+
+        const status = asString(turn.status);
+        if (status === "failed") {
+          this.clearTransientStates(entry);
+          const turnError = isRecord(turn.error) ? asString(turn.error.message) : null;
+          this.handleTurnFailure(entry, turnError ?? "Codex turn failed.");
+          return;
+        }
+
+        if (status === "interrupted") {
+          this.clearTransientStates(entry);
+          if (entry.pendingApprovals.size === 0) {
+            this.setStatus(entry, "idle");
+          }
+          return;
+        }
+
+        if (status === "completed" && entry.pendingApprovals.size === 0) {
+          this.clearTransientStates(entry);
+          this.emitFinalDiffIfNeeded(entry);
+          this.setStatus(entry, "idle");
+        }
+        return;
+      }
+
+      case "error": {
+        if (!entry || !params) return;
+        this.clearTransientStates(entry);
+        const error = isRecord(params.error) ? asString(params.error.message) : null;
+        this.handleTurnFailure(entry, error ?? "Codex reported an error.");
+        return;
+      }
+
+      default:
+        return;
+    }
+  }
+
+  private handleServerRequest(
+    id: JsonRpcId,
+    method: string,
+    params: AppServerNotification,
+  ): void {
+    const threadId = params ? asString(params.threadId) : null;
+    const entry = threadId ? this.getSessionByThreadId(threadId) : null;
+    if (!entry) {
+      this.client.respondError(id, `No active OpenRemote session is bound to ${method}.`);
+      return;
+    }
+
+    this.writeTrace(entry, "server-request", { id, method, params: params ?? null });
+
+    switch (method) {
+      case "item/commandExecution/requestApproval":
+        this.raiseCommandApproval(entry, id, params);
+        return;
+      case "item/fileChange/requestApproval":
+        this.raiseFileChangeApproval(entry, id, params);
+        return;
+      case "item/permissions/requestApproval":
+        this.raisePermissionApproval(entry, id, params);
+        return;
+      case "item/tool/requestUserInput":
+        this.raiseUserInputRequest(entry, id, params);
+        return;
+      default:
+        this.client.respondError(id, `OpenRemote does not support Codex request ${method}.`);
+        this.emit(
+          "error",
+          entry.id,
+          `Codex requested unsupported app-server action: ${method}.`,
+        );
+    }
+  }
+
+  private raiseCommandApproval(
+    entry: SessionEntry,
+    id: JsonRpcId,
+    params: AppServerNotification,
+  ): void {
+    if (!params) {
+      this.client.respondError(id, "Missing approval payload.");
+      return;
+    }
+
+    const availableDecisions = Array.isArray(params.availableDecisions)
+      ? params.availableDecisions
+      : ["accept", "decline"];
+    const requestId = String(id);
+    const options = availableDecisions.map((decision, index) => ({
+      index,
+      label: this.labelCommandDecision(decision),
+      shortcutKey: null,
+    }));
+
+    const lines = [
+      asString(params.reason) ?? "Codex needs approval before running a command.",
+      asString(params.command) ? `Command: ${params.command}` : null,
+      asString(params.cwd) ? `Directory: ${params.cwd}` : null,
+    ].filter((line): line is string => Boolean(line));
+
+    entry.pendingApprovals.set(requestId, {
+      options,
+      respond: async (optionIndex) => {
+        this.client.respond(id, {
+          decision: availableDecisions[optionIndex] as Record<string, unknown> | string,
+        });
+      },
+    });
+
+    this.setStatus(entry, "busy");
+    this.emit("approval", entry.id, requestId, "Command approval", lines.join("\n"), options);
+  }
+
+  private raiseFileChangeApproval(
+    entry: SessionEntry,
+    id: JsonRpcId,
+    params: AppServerNotification,
+  ): void {
+    const decisions = ["accept", "acceptForSession", "decline", "cancel"];
+    const requestId = String(id);
+    const options = decisions.map((decision, index) => ({
+      index,
+      label: this.labelFileDecision(decision),
+      shortcutKey: null,
+    }));
+
+    const lines = [
+      asString(params?.reason) ?? "Codex needs approval before applying file changes.",
+      asString(params?.grantRoot) ? `Requested root: ${params?.grantRoot}` : null,
+    ].filter((line): line is string => Boolean(line));
+
+    entry.pendingApprovals.set(requestId, {
+      options,
+      respond: async (optionIndex) => {
+        this.client.respond(id, { decision: decisions[optionIndex] });
+      },
+    });
+
+    this.setStatus(entry, "busy");
+    this.emit("approval", entry.id, requestId, "File change approval", lines.join("\n"), options);
+  }
+
+  private raisePermissionApproval(
+    entry: SessionEntry,
+    id: JsonRpcId,
+    params: AppServerNotification,
+  ): void {
+    const requestId = String(id);
+    const options: ParsedOption[] = [
+      { index: 0, label: "Allow once", shortcutKey: null },
+      { index: 1, label: "Allow for session", shortcutKey: null },
+    ];
+
+    const permissions =
+      isRecord(params?.permissions) ? (params.permissions as Record<string, unknown>) : {};
+
+    entry.pendingApprovals.set(requestId, {
+      options,
+      respond: async (optionIndex) => {
+        this.client.respond(id, {
+          permissions: {
+            network: permissions.network ?? undefined,
+            fileSystem: permissions.fileSystem ?? undefined,
+          },
+          scope: optionIndex === 0 ? "turn" : "session",
+        });
+      },
+    });
+
+    const lines = [
+      asString(params?.reason) ?? "Codex requested additional permissions.",
+      permissions.network ? "Network access requested." : null,
+      permissions.fileSystem ? "File system access requested." : null,
+    ].filter((line): line is string => Boolean(line));
+
+    this.setStatus(entry, "busy");
+    this.emit("approval", entry.id, requestId, "Permissions approval", lines.join("\n"), options);
+  }
+
+  private raiseUserInputRequest(
+    entry: SessionEntry,
+    id: JsonRpcId,
+    params: AppServerNotification,
+  ): void {
+    const questions = Array.isArray(params?.questions) ? params.questions : [];
+    const [question] = questions;
+    if (!isRecord(question)) {
+      this.client.respondError(id, "OpenRemote could not parse Codex user-input questions.");
+      this.emit("error", entry.id, "Codex requested interactive input that OpenRemote could not parse.");
+      return;
+    }
+
+    const optionsSource = Array.isArray(question.options) ? question.options : null;
+    const questionId = asString(question.id);
+    if (!questionId || !optionsSource || optionsSource.length === 0) {
+      this.client.respondError(
+        id,
+        "OpenRemote only supports single-choice Codex questions with explicit options.",
+      );
+      this.emit(
+        "error",
+        entry.id,
+        "Codex requested interactive input that the mobile bridge does not support yet.",
+      );
+      return;
+    }
+
+    const options: ParsedOption[] = optionsSource.map((option, index) => ({
+      index,
+      label:
+        isRecord(option) && typeof option.label === "string"
+          ? option.label
+          : `Option ${index + 1}`,
+      shortcutKey: null,
+    }));
+
+    const requestId = String(id);
+    entry.pendingApprovals.set(requestId, {
+      options,
+      respond: async (optionIndex) => {
+        const option = optionsSource[optionIndex];
+        const label =
+          isRecord(option) && typeof option.label === "string"
+            ? option.label
+            : options[optionIndex]?.label ?? `Option ${optionIndex + 1}`;
+        this.client.respond(id, {
+          answers: {
+            [questionId]: {
+              answers: [label],
+            },
+          },
+        });
+      },
+    });
+
+    this.setStatus(entry, "busy");
     this.emit(
       "approval",
       entry.id,
-      entry.pendingRequestId,
-      title,
-      message,
-      parsed.options,
+      requestId,
+      typeof question.header === "string" ? question.header : "Question",
+      typeof question.question === "string"
+        ? question.question
+        : "Codex requires your input to continue.",
+      options,
     );
   }
 
-  private extractApprovalTextParts(
-    contextText: string,
-  ): { title: string | null; message: string } {
-    const lines = contextText
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    if (lines.length >= 2 && lines[0].length <= 80) {
-      return {
-        title: lines[0],
-        message: lines.slice(1).join("\n"),
-      };
-    }
-
-    return {
-      title: null,
-      message: contextText.trim() || "Approval required",
-    };
-  }
-
-  private stripAnsi(value: string): string {
-    return value
-      .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "")
-      .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
-      .replace(/\r\n/g, "\n")
-      .replace(/\r(?!\n)/g, "\n")
-      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
-      .replace(/\u001b/g, "");
-  }
-
-  private beginCodexSessionDiscovery(entry: SessionEntry, resume: boolean): void {
-    if (entry.discoveryTimer) {
-      clearInterval(entry.discoveryTimer);
-      entry.discoveryTimer = null;
-    }
-
-    if (resume && entry.providerSessionId) {
-      this.emit("providerSession", entry.id, entry.providerSessionId);
+  private handleTurnFailure(entry: SessionEntry, message: string): void {
+    if (!this.sessions.has(entry.id)) {
       return;
     }
 
-    const startedAtMs = Date.now();
-    let attempts = 0;
-    entry.discoveryTimer = setInterval(() => {
-      attempts += 1;
-      const current = this.sessions.get(entry.id);
-      if (!current || current !== entry) {
-        if (entry.discoveryTimer) {
-          clearInterval(entry.discoveryTimer);
-          entry.discoveryTimer = null;
-        }
-        return;
-      }
-
-      const discovered = findCodexSessionIdForProject(entry.projectPath, startedAtMs);
-      if (discovered) {
-        current.providerSessionId = discovered;
-        this.emit("providerSession", current.id, discovered);
-        if (current.discoveryTimer) {
-          clearInterval(current.discoveryTimer);
-          current.discoveryTimer = null;
-        }
-        return;
-      }
-
-      if (attempts >= 20 && current.discoveryTimer) {
-        clearInterval(current.discoveryTimer);
-        current.discoveryTimer = null;
-      }
-    }, 1_000);
+    this.clearTransientStates(entry);
+    entry.pendingDiff = null;
+    entry.activeTurnId = null;
+    entry.pendingApprovals.clear();
+    this.writeTrace(entry, "turn-failed", { message });
+    this.emit("error", entry.id, message);
+    this.setStatus(entry, "failed");
   }
 
-  private clearRuntimeTimers(entry: SessionEntry): void {
+  private handleClientClosed(reason: string): void {
+    for (const entry of [...this.sessions.values()]) {
+      this.finalizeWithError(entry, `Codex app-server disconnected: ${reason}`);
+    }
+  }
+
+  private finalizeWithError(entry: SessionEntry, message: string): void {
+    if (!this.sessions.has(entry.id)) {
+      return;
+    }
+    this.writeTrace(entry, "session-failed", { message });
+    this.emit("error", entry.id, message);
+    this.finalizeSession(entry, "failed", 1, false);
+  }
+
+  private finalizeSession(
+    entry: SessionEntry,
+    status: SessionStatus,
+    exitCode: number,
+    emitStatus = true,
+  ): void {
+    if (!this.sessions.has(entry.id)) {
+      return;
+    }
+
+    if (emitStatus) {
+      this.setStatus(entry, status);
+    } else {
+      entry.status = status;
+    }
+
     if (entry.timeout) {
       clearTimeout(entry.timeout);
       entry.timeout = null;
     }
-    if (entry.idleCompletionTimer) {
-      clearTimeout(entry.idleCompletionTimer);
-      entry.idleCompletionTimer = null;
+
+    if (entry.providerSessionId) {
+      this.sessionByThreadId.delete(entry.providerSessionId);
     }
-    if (entry.discoveryTimer) {
-      clearInterval(entry.discoveryTimer);
-      entry.discoveryTimer = null;
+
+    this.clearTransientStates(entry);
+    entry.activeTurnId = null;
+    entry.pendingApprovals.clear();
+    this.writeTrace(entry, "session-finalized", { status, exitCode });
+    this.emit("complete", entry.id, exitCode, Date.now() - entry.startedAt);
+    this.closeTrace(entry);
+    this.sessions.delete(entry.id);
+
+    if (this.sessions.size === 0) {
+      void this.client.stop();
     }
-    if (entry.modeHandshakeTimer) {
-      clearTimeout(entry.modeHandshakeTimer);
-      entry.modeHandshakeTimer = null;
+  }
+
+  private setStatus(entry: SessionEntry, status: SessionStatus): void {
+    if (!this.sessions.has(entry.id) || entry.status === status) {
+      return;
     }
-    if (entry.submitTimer) {
-      clearTimeout(entry.submitTimer);
-      entry.submitTimer = null;
+    entry.status = status;
+    this.emit("status", entry.id, status);
+  }
+
+  private emitReadableBlock(
+    entry: SessionEntry,
+    block: Omit<SessionReadableBlockIngest, "seq" | "occurredAt"> & {
+      seq?: number;
+      occurredAt?: string;
+    },
+  ): void {
+    this.emit("readableBlock", entry.id, {
+      ...block,
+      occurredAt: block.occurredAt ?? new Date().toISOString(),
+    });
+  }
+
+  private setReasoningActive(entry: SessionEntry, active: boolean): void {
+    if (entry.reasoningActive === active) {
+      return;
+    }
+    entry.reasoningActive = active;
+    this.emitReadableBlock(entry, {
+      kind: "thinking",
+      title: "Thinking",
+      body: "Thinking",
+      metadata: {
+        active,
+      },
+    });
+  }
+
+  private setCommandRunning(entry: SessionEntry, running: boolean): void {
+    const nextCount = running
+      ? entry.commandRunning + 1
+      : Math.max(0, entry.commandRunning - 1);
+    const wasActive = entry.commandRunning > 0;
+    const isActive = nextCount > 0;
+    entry.commandRunning = nextCount;
+    if (wasActive === isActive) {
+      return;
+    }
+    this.emitReadableBlock(entry, {
+      kind: "command",
+      title: "Running commands",
+      body: "Running commands",
+      metadata: {
+        active: isActive,
+        state: isActive ? "running" : "completed",
+        displayMode: "status-only",
+      },
+    });
+  }
+
+  private emitFinalDiffIfNeeded(entry: SessionEntry): void {
+    const diff = entry.pendingDiff?.trim();
+    entry.pendingDiff = null;
+    if (!diff || diff === entry.lastEmittedDiff) {
+      return;
+    }
+
+    entry.lastEmittedDiff = diff;
+    this.emitReadableBlock(entry, {
+      kind: "code",
+      title: "Code",
+      body: diff,
+      metadata: {
+        format: "diff",
+        languageHint: "diff",
+        final: true,
+      },
+    });
+  }
+
+  private clearTransientStates(entry: SessionEntry): void {
+    this.setReasoningActive(entry, false);
+    while (entry.commandRunning > 0) {
+      this.setCommandRunning(entry, false);
+    }
+  }
+
+  private getSessionByThreadId(threadId: string): SessionEntry | null {
+    const sessionId = this.sessionByThreadId.get(threadId);
+    if (!sessionId) {
+      return null;
+    }
+    return this.sessions.get(sessionId) ?? null;
+  }
+
+  private labelCommandDecision(decision: unknown): string {
+    if (decision === "accept") return "Approve";
+    if (decision === "acceptForSession") return "Approve for session";
+    if (decision === "decline") return "Deny";
+    if (decision === "cancel") return "Cancel";
+    if (isRecord(decision) && "acceptWithExecpolicyAmendment" in decision) {
+      return "Approve and remember";
+    }
+    if (isRecord(decision) && "applyNetworkPolicyAmendment" in decision) {
+      return "Approve network rule";
+    }
+    return "Approve";
+  }
+
+  private labelFileDecision(decision: string): string {
+    switch (decision) {
+      case "accept":
+        return "Approve";
+      case "acceptForSession":
+        return "Approve for session";
+      case "decline":
+        return "Deny";
+      case "cancel":
+        return "Cancel";
+      default:
+        return "Approve";
     }
   }
 
@@ -1192,10 +1116,10 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       sessionId: entry.id,
       projectPath: entry.projectPath,
       tracePath,
+      transport: "codex-app-server",
     });
     this.emit("sessionLog", entry.id, tracePath);
-    log.debug(`${ts()} session ${entry.id} - PTY trace ${tracePath}`);
-    this.openMirrorWindow(entry);
+    log.debug(`${ts()} session ${entry.id} - app-server trace ${tracePath}`);
   }
 
   private writeTrace(entry: SessionEntry, event: string, payload: Record<string, unknown>): void {
@@ -1219,65 +1143,4 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
     entry.ptyTraceStream.end();
     entry.ptyTraceStream = null;
   }
-
-  private submitPrompt(entry: SessionEntry, prompt: string, reason: string): void {
-    if (!entry.pty) {
-      return;
-    }
-    if (entry.submitTimer) {
-      clearTimeout(entry.submitTimer);
-      entry.submitTimer = null;
-    }
-
-    this.writeTrace(entry, "pty-input", { text: prompt, reason, phase: "insert" });
-    entry.pty.write(prompt);
-    entry.submitTimer = setTimeout(() => {
-      const current = this.sessions.get(entry.id);
-      if (!current || current !== entry || !current.pty) {
-        return;
-      }
-      this.writeTrace(current, "pty-input", { text: "\\r", reason, phase: "submit" });
-      current.pty.write("\r");
-      current.submitTimer = null;
-    }, 120);
-  }
-
-  private openMirrorWindow(entry: SessionEntry): void {
-    if (entry.mirrorWindowOpened || process.platform !== "win32" || !entry.ptyTracePath) {
-      return;
-    }
-
-    const enabled = process.env.OPENREMOTE_PTY_WINDOW;
-    if (enabled !== "1" && enabled?.toLowerCase() !== "true") {
-      return;
-    }
-
-    const viewerPath = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "..",
-      "tools",
-      "pty-trace-viewer.js",
-    );
-
-    try {
-      spawn(process.execPath, [viewerPath, entry.ptyTracePath, entry.id], {
-        detached: true,
-        stdio: "ignore",
-        windowsHide: false,
-      }).unref();
-      entry.mirrorWindowOpened = true;
-      this.writeTrace(entry, "mirror-window-opened", {
-        viewerPath,
-        tracePath: entry.ptyTracePath,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.writeTrace(entry, "mirror-window-error", { message });
-      log.debug(`${ts()} session ${entry.id} - failed to open PTY mirror window: ${message}`);
-    }
-  }
-}
-
-function providerSessionIdOrLast(providerSessionId?: string | null): string {
-  return providerSessionId || "--last";
 }

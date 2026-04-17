@@ -1,14 +1,19 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { log } from "./logger.js";
 import { Bridge } from "./bridge.js";
+import { ClaudeRunner } from "./claude-runner.js";
 import { CodexRunner } from "./codex-runner.js";
 import type { ProviderRunner } from "./provider-runner.js";
 import { QwenRunner } from "./qwen-runner.js";
-import type { AgentProvider, InboundMessage, SessionStatus } from "./types.js";
+import type { AgentProvider, AppConfig, AttachmentRef, InboundMessage, SessionStatus } from "./types.js";
 import type { DashboardState } from "./terminal-ui.js";
 
 function providerLabel(provider: AgentProvider): string {
-  return provider === "qwen" ? "Qwen" : "Codex";
+  if (provider === "qwen") return "Qwen";
+  if (provider === "claude") return "Claude";
+  return "Codex";
 }
 
 /**
@@ -26,18 +31,58 @@ export class SessionManager {
     private readonly bridge: Bridge,
     private readonly apiKey: string,
     supportedProviders: AgentProvider[],
+    private readonly config?: AppConfig,
   ) {
     this.runners = {
       ...(supportedProviders.includes("codex") ? { codex: new CodexRunner() } : {}),
       ...(supportedProviders.includes("qwen") ? { qwen: new QwenRunner() } : {}),
+      ...(supportedProviders.includes("claude") ? { claude: new ClaudeRunner() } : {}),
     };
     this.wireRunnerEvents();
+  }
+
+  /**
+   * Download attachments from signed URLs to a local temp directory.
+   * Returns an array of local file paths.
+   */
+  private async downloadAttachments(
+    sessionId: string,
+    refs: AttachmentRef[],
+  ): Promise<string[]> {
+    if (refs.length === 0) return [];
+
+    const localDir = join(tmpdir(), "openremote-attachments", sessionId);
+    mkdirSync(localDir, { recursive: true });
+
+    const localPaths: string[] = [];
+
+    for (const ref of refs) {
+      const localPath = join(localDir, ref.name);
+
+      try {
+        const resp = await fetch(ref.url);
+
+        if (!resp.ok) {
+          log.debug(`Failed to download attachment ${ref.name}: ${resp.status}`);
+          continue;
+        }
+
+        const buffer = Buffer.from(await resp.arrayBuffer());
+        writeFileSync(localPath, buffer);
+        localPaths.push(localPath);
+        log.debug(`Downloaded attachment to ${localPath} (${buffer.length} bytes)`);
+      } catch (err) {
+        log.debug(`Error downloading attachment ${ref.name}: ${err}`);
+      }
+    }
+
+    return localPaths;
   }
 
   handleMessage(msg: InboundMessage): void {
     switch (msg.type) {
       case "session:start":
-        this.handleStart(msg.payload);
+        void this.handleStart(msg.payload);
         break;
       case "session:cancel":
         this.handleCancel(msg.payload.sessionId);
@@ -50,7 +95,7 @@ export class SessionManager {
         );
         break;
       case "session:input":
-        this.handleInput(msg.payload);
+        void this.handleInput(msg.payload);
         break;
       case "session:finish":
         this.handleFinish(msg.payload.sessionId);
@@ -88,7 +133,7 @@ export class SessionManager {
     });
   }
 
-  private handleStart(payload: {
+  private async handleStart(payload: {
     sessionId: string;
     provider: AgentProvider;
     prompt: string;
@@ -98,7 +143,8 @@ export class SessionManager {
     approvalMode: "full-auto" | "auto-edit" | "suggest";
     planMode: boolean;
     forceReplace?: boolean;
-  }): void {
+    attachments?: AttachmentRef[];
+  }): Promise<void> {
     const runner = this.getRunner(payload.provider);
     if (!runner) {
       this.failUnsupportedProvider(payload.sessionId, payload.provider);
@@ -124,6 +170,12 @@ export class SessionManager {
       return;
     }
 
+    // Download attachments from Supabase Storage if present
+    let localAttachments: string[] | undefined;
+    if (payload.attachments && payload.attachments.length > 0) {
+      localAttachments = await this.downloadAttachments(payload.sessionId, payload.attachments);
+    }
+
     log.step("Starting a new session");
     log.setDashboard({
       activeSessions: this.getActiveSessionCount() + 1,
@@ -139,6 +191,7 @@ export class SessionManager {
 
     this.sessionProviders.set(payload.sessionId, payload.provider);
     this.sessionStatuses.set(payload.sessionId, "queued");
+    this.bridge.registerSessionProvider(payload.sessionId, payload.provider);
     this.updateActiveSessionCount();
     runner.startSession({
       sessionId: payload.sessionId,
@@ -150,6 +203,7 @@ export class SessionManager {
       planMode: payload.planMode,
       apiKey: payload.provider === "codex" ? this.apiKey : undefined,
       providerSessionId: payload.provider === "qwen" ? payload.sessionId : null,
+      attachments: localAttachments,
     });
   }
 
@@ -195,7 +249,7 @@ export class SessionManager {
     }
   }
 
-  private handleInput(payload: {
+  private async handleInput(payload: {
     sessionId: string;
     text: string;
     provider?: AgentProvider;
@@ -206,7 +260,8 @@ export class SessionManager {
     approvalMode?: "full-auto" | "auto-edit" | "suggest";
     providerSessionId?: string | null;
     forceReplace?: boolean;
-  }): void {
+    attachments?: AttachmentRef[];
+  }): Promise<void> {
     const provider = payload.provider ?? this.sessionProviders.get(payload.sessionId) ?? null;
     if (!provider) {
       log.card(
@@ -228,6 +283,12 @@ export class SessionManager {
     if (!runner) {
       this.failUnsupportedProvider(payload.sessionId, provider);
       return;
+    }
+
+    // Download attachments from Supabase Storage if present
+    let localAttachments: string[] | undefined;
+    if (payload.attachments && payload.attachments.length > 0) {
+      localAttachments = await this.downloadAttachments(payload.sessionId, payload.attachments);
     }
 
     if (!this.sessionProviders.has(payload.sessionId)) {
@@ -253,7 +314,7 @@ export class SessionManager {
         sessionState: "resuming",
         sessionDetail: "Reopening the selected conversation",
         providerName: providerLabel(provider),
-        modelName: payload.modelName ?? (provider === "qwen" ? "qwen-default" : "gpt-5.4"),
+        modelName: payload.modelName ?? (provider === "qwen" ? "qwen-default" : provider === "claude" ? "claude-sonnet-4-6" : "gpt-5.4"),
         reasoning: payload.reasoningEffort ?? "medium",
         approvalMode: payload.approvalMode,
       });
@@ -265,13 +326,14 @@ export class SessionManager {
         sessionId: payload.sessionId,
         projectPath: payload.projectPath,
         prompt: payload.text,
-        modelName: payload.modelName ?? (provider === "qwen" ? "qwen-default" : "gpt-5.4"),
+        modelName: payload.modelName ?? (provider === "qwen" ? "qwen-default" : provider === "claude" ? "claude-sonnet-4-6" : "gpt-5.4"),
         reasoningEffort: payload.reasoningEffort ?? "medium",
         approvalMode: payload.approvalMode,
         planMode: provider === "qwen" ? false : (payload.planMode ?? false),
         apiKey: provider === "codex" ? this.apiKey : undefined,
         providerSessionId:
           payload.providerSessionId ?? (provider === "qwen" ? payload.sessionId : null),
+        attachments: localAttachments,
       });
       return;
     }
@@ -299,6 +361,7 @@ export class SessionManager {
       provider === "qwen" ? false : payload.planMode,
       payload.reasoningEffort,
       payload.approvalMode,
+      localAttachments,
     );
   }
 
@@ -320,6 +383,13 @@ export class SessionManager {
         this.bridge.send({
           type: "session:output",
           payload: { sessionId: sid, data, timestamp: Date.now() },
+        });
+      });
+
+      runner.on("readableBlock", (sid, block) => {
+        this.bridge.send({
+          type: "session:block",
+          payload: { sessionId: sid, block },
         });
       });
 

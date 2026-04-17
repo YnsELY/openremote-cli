@@ -264,6 +264,7 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
     _planMode?: boolean,
     reasoningEffort?: string,
     approvalMode?: "full-auto" | "auto-edit" | "suggest",
+    _attachments?: string[],
   ): boolean {
     const entry = this.sessions.get(sessionId);
     if (!entry) {

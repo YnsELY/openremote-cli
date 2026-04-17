@@ -52,7 +52,7 @@ export async function startCommand() {
     log.step("Connecting to your machine");
     const apiKey = process.env.OPENAI_API_KEY || "";
     const bridge = new Bridge(config, machineToken, supportedProviders);
-    const sessions = new SessionManager(bridge, apiKey, supportedProviders);
+    const sessions = new SessionManager(bridge, apiKey, supportedProviders, config);
     bridge.on("connected", () => {
         updateConfig({ lastSeenAt: new Date().toISOString() });
         log.setDashboard({

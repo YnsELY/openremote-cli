@@ -28,6 +28,7 @@ export declare class Bridge extends EventEmitter {
     disconnect(): Promise<void>;
     send(msg: OutboundMessage): void;
     get isConnected(): boolean;
+    registerSessionProvider(sessionId: string, provider: AgentProvider): void;
     private openConnection;
     private registerInboundEvent;
     private handleOutboundMessage;
