@@ -203,7 +203,7 @@ The **Codex Remote** mobile app is the remote control for your machine. Once `op
 The app gives you full visibility into what the agent is doing: every command it runs, every file it edits, every thought it has — all streamed live to your screen in a clean, readable format.
 
 <div align="center">
-  <img src="screenshots/2.png" alt="Codex Remote Mobile App" width="700" />
+  <img src="screenshots/2.png" alt="Codex Remote Mobile App" width="350" />
 </div>
 
 ---
