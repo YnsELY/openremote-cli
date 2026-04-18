@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { configExists, loadConfig } from "./config.js";
-import { hasApiKey, hasAuthToken } from "./credentials.js";
+import { hasAuthToken } from "./credentials.js";
 import { getShellLaunch } from "./shell.js";
 function tryExec(cmd) {
     try {
@@ -102,19 +102,6 @@ export function checkConfig() {
         detail: cfg?.machineId
             ? `Machine ID: ${cfg.machineId.slice(0, 8)}...`
             : "Config file corrupt. Run: openremote setup",
-    };
-}
-export function checkApiKey() {
-    const has = hasApiKey();
-    const detail = process.platform === "win32"
-        ? "Stored in local encrypted credential store"
-        : "Stored in local credential file";
-    return {
-        name: "OpenAI API Key",
-        ok: has,
-        detail: has
-            ? detail
-            : "Not set. Run: openremote setup",
     };
 }
 export function checkAuthToken() {

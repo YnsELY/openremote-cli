@@ -10,7 +10,6 @@ export declare function checkClaudeCodeCli(): CheckResult;
 export declare function checkQwenCli(): CheckResult;
 export declare function getSupportedProviders(): AgentProvider[];
 export declare function checkConfig(): CheckResult;
-export declare function checkApiKey(): CheckResult;
 export declare function checkAuthToken(): CheckResult;
 export declare function checkSupabaseUrl(): CheckResult;
 export declare function checkSupabaseAnonKey(): CheckResult;

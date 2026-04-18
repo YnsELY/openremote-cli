@@ -632,8 +632,8 @@ export class ClaudeRunner extends EventEmitter {
         // Extract the meaningful part of the error for display
         const message = errorText.length > 300 ? errorText.slice(0, 300) + "…" : errorText;
         const options = [
-            { index: 0, label: "Autoriser", shortcutKey: "y" },
-            { index: 1, label: "Refuser", shortcutKey: "n" },
+            { index: 0, label: "Approve", shortcutKey: "y" },
+            { index: 1, label: "Deny", shortcutKey: "n" },
         ];
         log.debug(`${ts()} Raising permission approval for session ${entry.id}`);
         this.traceEvent(entry, "permission-approval", { requestId, message });

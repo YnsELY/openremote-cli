@@ -9,6 +9,143 @@ import { buildShellCommand, getShellLaunch, resolveExecutable } from "./shell.js
 function ts() {
     return `[${new Date().toISOString()}] [qwen-runner]`;
 }
+/**
+ * Minimal VT100 terminal screen emulator.
+ * Handles cursor positioning, erase-to-EOL, and clear-screen so we always
+ * operate on what is actually *visible* on screen rather than the raw byte stream.
+ */
+class ScreenBuffer {
+    rows;
+    curRow = 0;
+    curCol = 0;
+    width;
+    height;
+    constructor(width = 220, height = 50) {
+        this.width = width;
+        this.height = height;
+        this.rows = Array.from({ length: height }, () => "");
+    }
+    write(raw) {
+        let i = 0;
+        while (i < raw.length) {
+            const ch = raw[i];
+            if (ch === "\x1b") {
+                const rest = raw.slice(i + 1);
+                // OSC: ESC ] ... BEL or ST
+                const oscM = rest.match(/^][^\x07]*(?:\x07|\x1b\\)/);
+                if (oscM) {
+                    i += 1 + oscM[0].length;
+                    continue;
+                }
+                // CSI: ESC [ params cmd
+                const csiM = rest.match(/^\[([0-9;?]*)([A-Za-z@`])/);
+                if (csiM) {
+                    i += 1 + csiM[0].length;
+                    const params = csiM[1];
+                    const cmd = csiM[2];
+                    const nums = params.split(";").map((n) => (n === "" ? 0 : parseInt(n, 10)));
+                    const p0 = nums[0] ?? 0;
+                    const p1 = nums[1] ?? 0;
+                    if (cmd === "H" || cmd === "f") {
+                        this.curRow = Math.min(Math.max((p0 || 1) - 1, 0), this.height - 1);
+                        this.curCol = Math.min(Math.max((p1 || 1) - 1, 0), this.width - 1);
+                    }
+                    else if (cmd === "A") {
+                        this.curRow = Math.max(this.curRow - (p0 || 1), 0);
+                    }
+                    else if (cmd === "B") {
+                        this.curRow = Math.min(this.curRow + (p0 || 1), this.height - 1);
+                    }
+                    else if (cmd === "C") {
+                        this.curCol = Math.min(this.curCol + (p0 || 1), this.width - 1);
+                    }
+                    else if (cmd === "D") {
+                        this.curCol = Math.max(this.curCol - (p0 || 1), 0);
+                    }
+                    else if (cmd === "G") {
+                        this.curCol = Math.min(Math.max((p0 || 1) - 1, 0), this.width - 1);
+                    }
+                    else if (cmd === "K") {
+                        // Erase line: 0=to end, 1=to start, 2=whole line
+                        const row = this.rows[this.curRow] ?? "";
+                        if (p0 === 2) {
+                            this.rows[this.curRow] = "";
+                        }
+                        else if (p0 === 1) {
+                            this.rows[this.curRow] = " ".repeat(this.curCol) + row.slice(this.curCol);
+                        }
+                        else {
+                            this.rows[this.curRow] = row.slice(0, this.curCol);
+                        }
+                    }
+                    else if (cmd === "J") {
+                        if (p0 === 2 || p0 === 3) {
+                            this.rows = Array.from({ length: this.height }, () => "");
+                            this.curRow = 0;
+                            this.curCol = 0;
+                        }
+                        else if (p0 === 0) {
+                            this.rows[this.curRow] = (this.rows[this.curRow] ?? "").slice(0, this.curCol);
+                            for (let r = this.curRow + 1; r < this.height; r++)
+                                this.rows[r] = "";
+                        }
+                    }
+                    // Ignore: m (colors), h, l, s, u, etc.
+                    continue;
+                }
+                // ESC c — full reset
+                if (rest[0] === "c") {
+                    this.rows = Array.from({ length: this.height }, () => "");
+                    this.curRow = 0;
+                    this.curCol = 0;
+                    i += 2;
+                    continue;
+                }
+                // Other two-char ESC sequences — skip
+                i += rest.length > 0 ? 2 : 1;
+                continue;
+            }
+            if (ch === "\r") {
+                this.curCol = 0;
+                i += 1;
+                continue;
+            }
+            if (ch === "\n") {
+                this.curRow = Math.min(this.curRow + 1, this.height - 1);
+                i += 1;
+                continue;
+            }
+            if (ch === "\x08") { // backspace
+                if (this.curCol > 0)
+                    this.curCol -= 1;
+                i += 1;
+                continue;
+            }
+            // Skip other control chars
+            if (ch < " " && ch !== "\t") {
+                i += 1;
+                continue;
+            }
+            // Printable char — write to buffer
+            if (this.curRow < this.height) {
+                const row = this.rows[this.curRow] ?? "";
+                const padded = row.padEnd(this.curCol + 1, " ");
+                this.rows[this.curRow] =
+                    padded.slice(0, this.curCol) + ch + padded.slice(this.curCol + 1);
+                this.curCol = Math.min(this.curCol + 1, this.width - 1);
+            }
+            i += 1;
+        }
+    }
+    getScreen() {
+        return this.rows.map((r) => r.trimEnd()).join("\n");
+    }
+    reset() {
+        this.rows = Array.from({ length: this.height }, () => "");
+        this.curRow = 0;
+        this.curCol = 0;
+    }
+}
 function sanitizePtyEnv(extra = {}) {
     const env = {};
     for (const [key, value] of Object.entries(process.env)) {
@@ -61,6 +198,14 @@ export class QwenRunner extends EventEmitter {
             requestCounter: 0,
             ptyTracePath: null,
             ptyTraceStream: null,
+            screen: new ScreenBuffer(),
+            emittedToolSignatures: new Set(),
+            pendingTextBlocks: new Map(),
+            emittedTextBodies: new Set(),
+            pendingAssistantText: "",
+            emittedAssistantText: "",
+            assistantEmitTimer: null,
+            lastThinkingLabel: null,
         };
         this.ensureTrace(entry);
         this.sessions.set(sessionId, entry);
@@ -90,6 +235,14 @@ export class QwenRunner extends EventEmitter {
             requestCounter: 0,
             ptyTracePath: null,
             ptyTraceStream: null,
+            screen: new ScreenBuffer(),
+            emittedToolSignatures: new Set(),
+            pendingTextBlocks: new Map(),
+            emittedTextBodies: new Set(),
+            pendingAssistantText: "",
+            emittedAssistantText: "",
+            assistantEmitTimer: null,
+            lastThinkingLabel: null,
         };
         this.ensureTrace(entry);
         this.sessions.set(sessionId, entry);
@@ -239,6 +392,7 @@ export class QwenRunner extends EventEmitter {
             clearTimeout(entry.idleCompletionTimer);
             entry.idleCompletionTimer = null;
         }
+        this.flushPendingAssistantText(entry);
         if (!entry.pty) {
             const duration = Date.now() - entry.startedAt;
             this.emit("complete", sessionId, 130, duration);
@@ -267,6 +421,7 @@ export class QwenRunner extends EventEmitter {
             clearTimeout(entry.idleCompletionTimer);
             entry.idleCompletionTimer = null;
         }
+        this.flushPendingAssistantText(entry);
         entry.pendingOptions = [];
         entry.pendingRequestId = null;
         entry.awaitingApproval = false;
@@ -376,7 +531,6 @@ export class QwenRunner extends EventEmitter {
         entry.prompt = prompt;
         this.emit("status", entry.id, "running");
         this.emit("providerSession", entry.id, entry.providerSessionId);
-        let buffer = "";
         processPty.onData((data) => {
             const current = this.sessions.get(entry.id);
             if (!current || current.launchId !== launchId || current.pty !== processPty) {
@@ -384,18 +538,14 @@ export class QwenRunner extends EventEmitter {
             }
             this.emit("output", entry.id, data);
             this.writeTrace(current, "pty-output", { data });
-            if (data.includes("\x1b[2J") || data.includes("\x1b[H\x1b[2J")) {
-                buffer = "";
-            }
-            buffer += data;
-            if (buffer.length > 8192) {
-                buffer = buffer.slice(-8192);
-            }
-            const clean = this.stripAnsi(buffer);
+            current.screen.write(data);
+            const clean = current.screen.getScreen();
+            this.parseScreenBlocks(current, clean);
             const parsed = this.parsePrompt(clean);
             if (parsed) {
                 this.raiseApproval(current, parsed.contextText, parsed.options);
-                buffer = "";
+                // Reset screen after approval so next turn starts fresh.
+                current.screen.reset();
             }
             else {
                 const genericApprovalMessage = this.detectGenericApproval(clean);
@@ -404,7 +554,7 @@ export class QwenRunner extends EventEmitter {
                         { index: 0, label: "Accept", shortcutKey: "y" },
                         { index: 1, label: "Reject", shortcutKey: "n" },
                     ]);
-                    buffer = "";
+                    current.screen.reset();
                 }
             }
             if (current.idleCompletionTimer) {
@@ -422,6 +572,7 @@ export class QwenRunner extends EventEmitter {
                         return;
                     }
                     log.debug(`${ts()} session ${entry.id} - no PTY output for 15s, marking idle`);
+                    this.flushPendingAssistantText(latest);
                     latest.status = "idle";
                     latest.pendingOptions = [];
                     latest.pendingRequestId = null;
@@ -469,6 +620,7 @@ export class QwenRunner extends EventEmitter {
                 return;
             }
             if (exitCode === 0) {
+                this.flushPendingAssistantText(current);
                 current.status = "idle";
                 this.emit("status", entry.id, "idle");
                 return;
@@ -503,6 +655,115 @@ export class QwenRunner extends EventEmitter {
             return "auto-edit";
         }
         return "default";
+    }
+    normalizeApprovalLine(line) {
+        return line
+            .replace(/^\s*[│|]\s?/, "")
+            .replace(/\s?[│|]\s*$/, "")
+            .replace(/^\s*[›❯>]\s*/, "")
+            .replace(/^\s*[?]\s+/, "")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+    isApprovalNoiseLine(line) {
+        if (!line) {
+            return true;
+        }
+        return (/^(?:approval|permission)\s+required$/i.test(line) ||
+            /^apply\s+this\s+change\??$/i.test(line) ||
+            /^waiting\s+for\s+(?:approval|user|confirmation)/i.test(line) ||
+            /^(?:thinking|analyzing|reasoning|working|loading|searching|mining)\b/i.test(line) ||
+            /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(line));
+    }
+    isApprovalActionLine(line) {
+        return (/^(?:Edit|Write|WriteFile|MultiEdit|Replace|CreateFile|ReadFile|ReadFolder|ReadManyFiles|ListFiles|ListDirectory|Grep|Glob|Search|SearchText|Shell|Bash|Run|Fetch|WebFetch)\b/.test(line) ||
+            /^(?:Command|File|Path)\s*:/i.test(line) ||
+            /(?:^|[ "'`])(?:[A-Za-z]:\\|\/)?[\w./\\-]+\.[A-Za-z0-9]+(?::\d+)?(?:[ "'`]|$)/.test(line) ||
+            /(?:powershell|cmd(?:\.exe)?|bash|sh|npm|pnpm|yarn|node|python|git|sed|cat|rm|mv|cp)\b/i.test(line));
+    }
+    buildApprovalDisplay(contextText) {
+        const lines = contextText
+            .split("\n")
+            .map((line) => this.normalizeApprovalLine(line))
+            .filter(Boolean);
+        const filtered = lines.filter((line) => !this.isApprovalNoiseLine(line));
+        const actionLine = filtered.find((line) => this.isApprovalActionLine(line)) ?? null;
+        if (actionLine) {
+            const messageLines = filtered.filter((line) => line !== actionLine);
+            return {
+                title: actionLine.length <= 120 ? actionLine : `${actionLine.slice(0, 117)}...`,
+                message: messageLines.join("\n") || actionLine,
+            };
+        }
+        if (filtered.length >= 2 && filtered[0].length <= 80) {
+            return {
+                title: filtered[0],
+                message: filtered.slice(1).join("\n"),
+            };
+        }
+        const fallback = filtered[0] ?? lines[0] ?? "Qwen requires confirmation";
+        return {
+            title: null,
+            message: fallback.length <= 220 ? fallback : `${fallback.slice(0, 217)}...`,
+        };
+    }
+    /**
+     * Extracts the content of the approval box surrounding the options block.
+     * Looks upward from the options lines until a ╭ border is found, and joins
+     * the inner lines (stripping "│" borders and excess whitespace). This keeps
+     * the tool header (e.g. "?  Edit App.tsx:…") and the diff preview so the
+     * mobile approval popup can display what exactly is being asked.
+     */
+    extractApprovalBoxContent(lines, blockStart, blockEnd) {
+        let top = -1;
+        for (let i = blockStart - 1; i >= Math.max(0, blockStart - 120); i -= 1) {
+            const raw = lines[i];
+            if (/^\s*╭/.test(raw)) {
+                top = i;
+                break;
+            }
+        }
+        if (top < 0)
+            return null;
+        let bottom = -1;
+        for (let i = blockEnd + 1; i < Math.min(lines.length, blockEnd + 40); i += 1) {
+            const raw = lines[i];
+            if (/^\s*╰/.test(raw)) {
+                bottom = i;
+                break;
+            }
+        }
+        if (bottom < 0)
+            bottom = Math.min(lines.length - 1, blockEnd + 20);
+        const inner = [];
+        for (let i = top + 1; i < bottom; i += 1) {
+            const raw = lines[i];
+            let cleaned = raw
+                .replace(/^\s*│\s?/, "")
+                .replace(/\s?│\s*$/, "")
+                .replace(/\s+$/, "");
+            cleaned = cleaned.replace(/^\s*›\s*/, "");
+            if (/^\s*$/.test(cleaned)) {
+                if (inner.length && inner[inner.length - 1] !== "")
+                    inner.push("");
+                continue;
+            }
+            if (this.isApprovalNoiseLine(this.normalizeApprovalLine(cleaned)) && inner.length === 0) {
+                continue;
+            }
+            // Stop before numbered choice options (they're already sent as options).
+            if (/^\s*\d+\.\s/.test(cleaned))
+                break;
+            if (/^Apply this change\??$/i.test(cleaned.trim())) {
+                inner.push(cleaned.trim());
+                break;
+            }
+            inner.push(cleaned);
+        }
+        // Drop trailing blanks.
+        while (inner.length && inner[inner.length - 1] === "")
+            inner.pop();
+        return inner.length ? inner.join("\n") : null;
     }
     parsePrompt(text) {
         const lines = text
@@ -631,8 +892,9 @@ export class QwenRunner extends EventEmitter {
         if (!looksInteractive) {
             return null;
         }
+        const boxContent = this.extractApprovalBoxContent(lines, bestStart, bestEnd);
         return {
-            contextText: contextText || region,
+            contextText: boxContent ?? contextText ?? region,
             options: bestOptions,
         };
     }
@@ -658,15 +920,15 @@ export class QwenRunner extends EventEmitter {
         }
         const lines = normalized
             .split("\n")
-            .map((line) => line.trim())
+            .map((line) => this.normalizeApprovalLine(line))
             .filter(Boolean);
-        const relevantLines = lines.filter((line) => !/waiting\s+for/i.test(line) &&
-            !/thinking/i.test(line) &&
-            line.length > 3);
-        const contextLine = relevantLines[relevantLines.length - 1] ??
-            lines[lines.length - 1] ??
+        const relevantLines = lines.filter((line) => !this.isApprovalNoiseLine(line) && line.length > 3);
+        const actionLine = relevantLines.find((line) => this.isApprovalActionLine(line));
+        const contextLine = actionLine ??
+            relevantLines[0] ??
+            lines[0] ??
             "Qwen requires confirmation";
-        return contextLine.length > 180 ? `${contextLine.slice(0, 177)}...` : contextLine;
+        return contextLine.length > 220 ? `${contextLine.slice(0, 217)}...` : contextLine;
     }
     raiseApproval(entry, message, options) {
         if (entry.approvalMode === "full-auto") {
@@ -751,20 +1013,188 @@ export class QwenRunner extends EventEmitter {
         entry.pendingRequestId = null;
     }
     extractApprovalTextParts(contextText) {
-        const lines = contextText
-            .split("\n")
-            .map((line) => line.trim())
-            .filter(Boolean);
-        if (lines.length >= 2 && lines[0].length <= 80) {
-            return {
-                title: lines[0],
-                message: lines.slice(1).join("\n"),
-            };
-        }
-        return {
-            title: null,
-            message: contextText.trim() || "Qwen requires confirmation",
+        return this.buildApprovalDisplay(contextText);
+    }
+    emitBlock(entry, kind, title, body, metadata) {
+        const block = {
+            kind,
+            body,
+            ...(title ? { title } : {}),
+            ...(metadata ? { metadata } : {}),
         };
+        this.emit("readableBlock", entry.id, block);
+    }
+    flushPendingAssistantText(entry) {
+        // Flush any legacy single-text pending
+        if (entry.assistantEmitTimer) {
+            clearTimeout(entry.assistantEmitTimer);
+            entry.assistantEmitTimer = null;
+        }
+        // Flush all pending text blocks
+        for (const [key, pending] of entry.pendingTextBlocks) {
+            if (pending.timer) {
+                clearTimeout(pending.timer);
+            }
+            if (pending.text && !entry.emittedTextBodies.has(pending.text)) {
+                this.emitBlock(entry, "text", null, pending.text);
+                entry.emittedTextBodies.add(pending.text);
+            }
+        }
+        entry.pendingTextBlocks.clear();
+        entry.pendingAssistantText = "";
+    }
+    /**
+     * Parses the current cleaned PTY screen to extract displayable blocks.
+     * - Tool calls (Grep/Glob/ReadFile/Shell/Edit/Write) → command/code/path blocks.
+     * - Assistant text (lines starting with ✦) → text block (debounced).
+     * - Spinner status text (⠋ Looking for a misplaced semicolon…) → thinking block.
+     * Deduplicates via signatures stored on the entry.
+     */
+    parseScreenBlocks(entry, clean) {
+        const lines = clean.split("\n");
+        // ── 1. Tool calls ────────────────────────────────────────────────────────
+        // Pattern: "│ ✓  ToolName args…" inside boxes.
+        // We only emit on completed icons (✓ ✎ ✔ ✗ ✖), not in-progress (⊶ ⧖ ⚡).
+        const toolLineRe = /[│|]\s*([✓✎⊶⧖⚡✗✖✔●])\s+(Grep|Glob|Shell|ReadFile|ReadFolder|ReadManyFiles|ListFiles|ListDirectory|Edit|Write|WriteFile|FindFiles|Search|SearchText|FileSystem|Bash|Run|MultiEdit|Replace|Todo|Task|Fetch|WebFetch|CreateFile)\b([^\n]*?)(?:\s*[│|])?$/;
+        for (const rawLine of lines) {
+            const match = rawLine.match(toolLineRe);
+            if (!match)
+                continue;
+            const [, icon, tool, rawArgs] = match;
+            if (icon === "⊶" || icon === "⧖" || icon === "⚡")
+                continue;
+            const args = rawArgs.trim().replace(/…$/, "").trim();
+            if (!args)
+                continue;
+            const signature = `tool:${tool}:${args}`;
+            if (entry.emittedToolSignatures.has(signature))
+                continue;
+            entry.emittedToolSignatures.add(signature);
+            const editLike = /^(Edit|Write|WriteFile|MultiEdit|Replace|CreateFile)$/.test(tool);
+            const readLike = /^(ReadFile|ReadFolder|ReadManyFiles|ListFiles|ListDirectory)$/.test(tool);
+            if (editLike) {
+                const filePath = (args.match(/^([^\s:]+)/) ?? [null, args])[1];
+                this.emitBlock(entry, "code", filePath, args, { tool, filePath });
+            }
+            else if (readLike) {
+                const filePath = (args.match(/^['""]?([^'""\s]+)['""]?/) ?? [null, args])[1];
+                this.emitBlock(entry, "path", tool, filePath, { tool });
+            }
+            else {
+                this.emitBlock(entry, "command", tool, args, { tool });
+            }
+        }
+        // ── 2. Assistant text ────────────────────────────────────────────────────
+        // The screen may show multiple ✦ blocks (chat history). Each is a separate
+        // text block. We collect all of them, track the longest capture per prefix
+        // key, and emit each once after 3s of stability.
+        const assistantBlocks = this.collectAssistantBlocks(lines);
+        for (const text of assistantBlocks) {
+            if (!text || entry.emittedTextBodies.has(text))
+                continue;
+            // Use the first 40 chars (normalized) as a stable key for a growing text.
+            const key = text.slice(0, 40);
+            const existing = entry.pendingTextBlocks.get(key);
+            if (existing) {
+                if (text.length > existing.text.length) {
+                    existing.text = text;
+                    // Reset stability timer.
+                    if (existing.timer)
+                        clearTimeout(existing.timer);
+                    existing.timer = setTimeout(() => {
+                        const latest = this.sessions.get(entry.id);
+                        if (!latest)
+                            return;
+                        const slot = latest.pendingTextBlocks.get(key);
+                        if (slot && !latest.emittedTextBodies.has(slot.text)) {
+                            this.emitBlock(latest, "text", null, slot.text);
+                            latest.emittedTextBodies.add(slot.text);
+                        }
+                        latest.pendingTextBlocks.delete(key);
+                    }, 3000);
+                }
+                // Text is shorter or same — ignore (reflow artifact).
+            }
+            else {
+                // New text block — start tracking.
+                const timer = setTimeout(() => {
+                    const latest = this.sessions.get(entry.id);
+                    if (!latest)
+                        return;
+                    const slot = latest.pendingTextBlocks.get(key);
+                    if (slot && !latest.emittedTextBodies.has(slot.text)) {
+                        this.emitBlock(latest, "text", null, slot.text);
+                        latest.emittedTextBodies.add(slot.text);
+                    }
+                    latest.pendingTextBlocks.delete(key);
+                }, 3000);
+                entry.pendingTextBlocks.set(key, { text, timer });
+            }
+        }
+        // ── 3. Spinner / thinking label ──────────────────────────────────────────
+        const thinkingMatch = clean.match(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+([A-Za-zÀ-ÿ][^\n(]{2,80}?)(?:\s*\(|\s*\.{2,3}|\n|$)/);
+        if (thinkingMatch) {
+            const label = thinkingMatch[1].trim();
+            if (label &&
+                label !== entry.lastThinkingLabel &&
+                !/waiting for user/i.test(label) &&
+                !/initializing/i.test(label) &&
+                !/dial-up/i.test(label) &&
+                !/snozberr/i.test(label) &&
+                !/microchip/i.test(label)) {
+                entry.lastThinkingLabel = label;
+                this.emitBlock(entry, "thinking", null, label);
+            }
+        }
+    }
+    /**
+     * Collect all ✦-prefixed text blocks from screen lines.
+     * Each block starts at a ✦ line and continues with indented continuation lines.
+     */
+    collectAssistantBlocks(lines) {
+        const blocks = [];
+        let i = 0;
+        while (i < lines.length) {
+            const line = lines[i];
+            if (/^\s{0,4}✦\s+/.test(line)) {
+                const collected = [];
+                const startLine = line.replace(/^\s{0,4}✦\s+/, "").trimEnd();
+                if (startLine)
+                    collected.push(startLine);
+                i += 1;
+                // Continuation lines: 4+ space indented, not a new ✦, not a border/spinner.
+                while (i < lines.length) {
+                    const next = lines[i];
+                    if (!next || next.trim() === "")
+                        break;
+                    if (/^\s{0,4}✦\s+/.test(next))
+                        break; // next assistant block
+                    if (/^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(next))
+                        break; // spinner
+                    if (/^[─━]{5,}/.test(next.trim()))
+                        break; // separator line
+                    if (/^[╭╮╯╰│]/.test(next.trim()))
+                        break; // box border
+                    if (/^[>│]/.test(next.trim()))
+                        break; // input prompt
+                    // Must be indented continuation
+                    if (/^\s{4}/.test(next)) {
+                        collected.push(next.replace(/^\s+/, "").trimEnd());
+                        i += 1;
+                    }
+                    else {
+                        break;
+                    }
+                }
+                const text = collected.join(" ").replace(/\s{2,}/g, " ").trim();
+                if (text.length >= 10)
+                    blocks.push(text);
+            }
+            else {
+                i += 1;
+            }
+        }
+        return blocks;
     }
     stripAnsi(value) {
         return value

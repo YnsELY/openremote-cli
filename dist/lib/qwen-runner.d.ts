@@ -19,11 +19,38 @@ export declare class QwenRunner extends EventEmitter implements ProviderRunner {
     private launchProcess;
     private buildArgs;
     private mapApprovalMode;
+    private normalizeApprovalLine;
+    private isApprovalNoiseLine;
+    private isApprovalActionLine;
+    private buildApprovalDisplay;
+    /**
+     * Extracts the content of the approval box surrounding the options block.
+     * Looks upward from the options lines until a ╭ border is found, and joins
+     * the inner lines (stripping "│" borders and excess whitespace). This keeps
+     * the tool header (e.g. "?  Edit App.tsx:…") and the diff preview so the
+     * mobile approval popup can display what exactly is being asked.
+     */
+    private extractApprovalBoxContent;
     private parsePrompt;
     private detectGenericApproval;
     private raiseApproval;
     private respondToDetectedApproval;
     private extractApprovalTextParts;
+    private emitBlock;
+    private flushPendingAssistantText;
+    /**
+     * Parses the current cleaned PTY screen to extract displayable blocks.
+     * - Tool calls (Grep/Glob/ReadFile/Shell/Edit/Write) → command/code/path blocks.
+     * - Assistant text (lines starting with ✦) → text block (debounced).
+     * - Spinner status text (⠋ Looking for a misplaced semicolon…) → thinking block.
+     * Deduplicates via signatures stored on the entry.
+     */
+    private parseScreenBlocks;
+    /**
+     * Collect all ✦-prefixed text blocks from screen lines.
+     * Each block starts at a ✦ line and continues with indented continuation lines.
+     */
+    private collectAssistantBlocks;
     private stripAnsi;
     private ensureTrace;
     private writeTrace;
