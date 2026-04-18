@@ -832,6 +832,33 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
     );
   }
 
+  private isApprovalPromptLine(line: string): boolean {
+    return (
+      /do\s+you\s+want\s+to\s+(?:proceed|continue|apply)/i.test(line) ||
+      /confirm\s+this\s+action/i.test(line) ||
+      /\b(?:approve|allow|confirm|continue|proceed|apply|autoriser|confirmer|continuer|valider)\b/i.test(
+        line,
+      ) && /[?]\s*$/.test(line)
+    );
+  }
+
+  private isExplicitApprovalChoiceLine(line: string): boolean {
+    return (
+      /\b(?:y\/n|yes\/no|accept\/reject|approve\/reject|allow\/deny)\b/i.test(line) ||
+      /^\s*(?:accept|reject|approve|deny|yes|no)\s*$/i.test(line)
+    );
+  }
+
+  private isOrdinaryAssistantLine(line: string): boolean {
+    return (
+      /\b(?:successful|successfully|completed|done|finished|imported|added|removed|updated|created|fixed)\b/i.test(
+        line,
+      ) ||
+      /^the\s+(?:edit|change|component|file)\s+/i.test(line) ||
+      /^i(?:'| )?ve\s+/i.test(line)
+    );
+  }
+
   private buildApprovalDisplay(contextText: string): { title: string | null; message: string } {
     const lines = contextText
       .split("\n")
@@ -1082,7 +1109,6 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
       /approval\s+required/i,
       /confirm\s+this\s+action/i,
       /do\s+you\s+want\s+to\s+(proceed|continue|apply)/i,
-      /\b(?:approve|approval|confirm|confirmation)\b/i,
     ];
 
     if (!approvalPatterns.some((pattern) => pattern.test(normalized))) {
@@ -1093,11 +1119,33 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
       .split("\n")
       .map((line) => this.normalizeApprovalLine(line))
       .filter(Boolean);
-    const relevantLines = lines.filter((line) => !this.isApprovalNoiseLine(line) && line.length > 3);
+    const tailLines = lines.slice(-12);
+    const strongPromptPresent = tailLines.some((line) =>
+      approvalPatterns.some((pattern) => pattern.test(line)),
+    );
+    const explicitChoicePresent = tailLines.some((line) => this.isExplicitApprovalChoiceLine(line));
+    const promptQuestionPresent = tailLines.some((line) => this.isApprovalPromptLine(line));
+
+    if (!strongPromptPresent && !explicitChoicePresent && !promptQuestionPresent) {
+      return null;
+    }
+
+    if (
+      !explicitChoicePresent &&
+      tailLines.some((line) => this.isOrdinaryAssistantLine(line))
+    ) {
+      return null;
+    }
+
+    const relevantLines = tailLines.filter(
+      (line) => !this.isApprovalNoiseLine(line) && line.length > 3,
+    );
     const actionLine = relevantLines.find((line) => this.isApprovalActionLine(line));
+    const promptLine = relevantLines.find((line) => this.isApprovalPromptLine(line));
     const contextLine =
       actionLine ??
-      relevantLines[0] ??
+      promptLine ??
+      (explicitChoicePresent ? relevantLines[0] : null) ??
       lines[0] ??
       "Qwen requires confirmation";
 
