@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="screenshots/logo.png" alt="Codex Remote Logo" width="200" />
+  <img src="screenshots/logo.png" alt="Codex Remote Logo" width="400" />
   <h1>Codex Remote — CLI</h1>
   <p><strong>Control your AI coding agent from your iPhone.</strong></p>
   <p>Run Codex, Qwen, or Claude on your machine and pilot every session remotely from the Codex Remote mobile app.</p>
@@ -201,6 +201,10 @@ The **Codex Remote** mobile app is the remote control for your machine. Once `op
 6. **Approve or reject actions** — when the agent asks for confirmation, a card appears in the app for you to validate directly from your phone
 
 The app gives you full visibility into what the agent is doing: every command it runs, every file it edits, every thought it has — all streamed live to your screen in a clean, readable format.
+
+<div align="center">
+  <img src="screenshots/2.png" alt="Codex Remote Mobile App" width="700" />
+</div>
 
 ---
 

@@ -22,6 +22,9 @@ export declare class QwenRunner extends EventEmitter implements ProviderRunner {
     private normalizeApprovalLine;
     private isApprovalNoiseLine;
     private isApprovalActionLine;
+    private isApprovalPromptLine;
+    private isExplicitApprovalChoiceLine;
+    private isOrdinaryAssistantLine;
     private buildApprovalDisplay;
     /**
      * Extracts the content of the approval box surrounding the options block.
