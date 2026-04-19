@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="screenshots/logo.png" alt="Codex Remote Logo" width="400" />
+  <img src="assets/screenshots/logo.png" alt="Codex Remote Logo" width="400" />
   <h1>Codex Remote — CLI</h1>
   <p><strong>Control your AI coding agent from your iPhone.</strong></p>
   <p>Run Codex, Qwen, or Claude on your machine and pilot every session remotely from the Codex Remote mobile app.</p>
@@ -93,7 +93,7 @@ openremote setup
 Run `setup` only once per machine. After it completes, proceed to `login`.
 
 <div align="center">
-  <img src="screenshots/setup.png" alt="openremote setup" width="700" />
+  <img src="assets/screenshots/setup.png" alt="openremote setup" width="700" />
 </div>
 
 ---
@@ -116,7 +116,7 @@ openremote login
 Once logged in, your machine is registered and ready to receive remote sessions. You can now run `openremote start`.
 
 <div align="center">
-  <img src="screenshots/login.png" alt="openremote login" width="700" />
+  <img src="assets/screenshots/login.png" alt="openremote login" width="700" />
 </div>
 
 ---
@@ -143,7 +143,7 @@ openremote start
 Press `Ctrl+C` to stop and disconnect.
 
 <div align="center">
-  <img src="screenshots/start.png" alt="openremote start" width="700" />
+  <img src="assets/screenshots/start.png" alt="openremote start" width="700" />
 </div>
 
 ---
@@ -203,7 +203,7 @@ The **Codex Remote** mobile app is the remote control for your machine. Once `op
 The app gives you full visibility into what the agent is doing: every command it runs, every file it edits, every thought it has — all streamed live to your screen in a clean, readable format.
 
 <div align="center">
-  <img src="screenshots/2.png" alt="Codex Remote Mobile App" width="350" />
+  <img src="assets/screenshots/2.png" alt="Codex Remote Mobile App" width="350" />
 </div>
 
 ---
