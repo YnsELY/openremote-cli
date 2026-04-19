@@ -12,7 +12,7 @@ export declare class QwenRunner extends EventEmitter implements ProviderRunner {
         ok: boolean;
         error?: string;
     };
-    inputToSession(sessionId: string, text: string, modelName?: string, _planMode?: boolean, reasoningEffort?: string, approvalMode?: "full-auto" | "auto-edit" | "suggest", _attachments?: string[]): boolean;
+    inputToSession(sessionId: string, text: string, modelName?: string, _planMode?: boolean, reasoningEffort?: string, approvalMode?: "full-auto" | "auto-edit" | "suggest", attachments?: string[]): boolean;
     cancelSession(sessionId: string): boolean;
     finishSession(sessionId: string): boolean;
     killAll(): void;
@@ -25,6 +25,14 @@ export declare class QwenRunner extends EventEmitter implements ProviderRunner {
     private isApprovalPromptLine;
     private isExplicitApprovalChoiceLine;
     private isOrdinaryAssistantLine;
+    private isTransientStatusText;
+    private cleanBoxInnerLine;
+    private extractSurroundingBoxLines;
+    private extractCodePreviewFromBox;
+    private updateLastActionContext;
+    private approvalDisplayNeedsActionFallback;
+    private extractLatestActionContextFromScreen;
+    private preparePromptDetectionLine;
     private buildApprovalDisplay;
     /**
      * Extracts the content of the approval box surrounding the options block.

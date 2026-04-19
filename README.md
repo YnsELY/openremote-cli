@@ -50,8 +50,8 @@ You only need **one** of the three agents — the CLI will detect which ones are
 Clone the repository and install the CLI dependencies:
 
 ```bash
-git clone https://github.com/your-username/codex-remote.git
-cd codex-remote/cli
+git clone https://github.com/YnsELY/openremote-cli.git
+cd openremote/cli
 npm install
 npm run build
 ```

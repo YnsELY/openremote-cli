@@ -16,14 +16,20 @@ function ts() {
  */
 class ScreenBuffer {
     rows;
+    rowReasoning;
     curRow = 0;
     curCol = 0;
+    currentFgMuted = false;
     width;
     height;
     constructor(width = 220, height = 50) {
         this.width = width;
         this.height = height;
         this.rows = Array.from({ length: height }, () => "");
+        this.rowReasoning = Array.from({ length: height }, () => false);
+    }
+    isRowReasoning(row) {
+        return this.rowReasoning[row] === true;
     }
     write(raw) {
         let i = 0;
@@ -70,9 +76,11 @@ class ScreenBuffer {
                         const row = this.rows[this.curRow] ?? "";
                         if (p0 === 2) {
                             this.rows[this.curRow] = "";
+                            this.rowReasoning[this.curRow] = false;
                         }
                         else if (p0 === 1) {
                             this.rows[this.curRow] = " ".repeat(this.curCol) + row.slice(this.curCol);
+                            this.rowReasoning[this.curRow] = false;
                         }
                         else {
                             this.rows[this.curRow] = row.slice(0, this.curCol);
@@ -81,23 +89,44 @@ class ScreenBuffer {
                     else if (cmd === "J") {
                         if (p0 === 2 || p0 === 3) {
                             this.rows = Array.from({ length: this.height }, () => "");
+                            this.rowReasoning = Array.from({ length: this.height }, () => false);
                             this.curRow = 0;
                             this.curCol = 0;
                         }
                         else if (p0 === 0) {
                             this.rows[this.curRow] = (this.rows[this.curRow] ?? "").slice(0, this.curCol);
-                            for (let r = this.curRow + 1; r < this.height; r++)
+                            for (let r = this.curRow + 1; r < this.height; r++) {
                                 this.rows[r] = "";
+                                this.rowReasoning[r] = false;
+                            }
                         }
                     }
-                    // Ignore: m (colors), h, l, s, u, etc.
+                    else if (cmd === "m") {
+                        // SGR — track foreground truecolor so we can identify Qwen's muted
+                        // "reasoning" color (RGB 108;112;134).
+                        if (params === "" || nums.some((n) => n === 0)) {
+                            this.currentFgMuted = false;
+                        }
+                        for (let k = 0; k < nums.length - 4; k += 1) {
+                            if (nums[k] === 38 && nums[k + 1] === 2) {
+                                const r = nums[k + 2];
+                                const g = nums[k + 3];
+                                const b = nums[k + 4];
+                                this.currentFgMuted = r === 108 && g === 112 && b === 134;
+                                break;
+                            }
+                        }
+                    }
+                    // Ignore: h, l, s, u, etc.
                     continue;
                 }
                 // ESC c — full reset
                 if (rest[0] === "c") {
                     this.rows = Array.from({ length: this.height }, () => "");
+                    this.rowReasoning = Array.from({ length: this.height }, () => false);
                     this.curRow = 0;
                     this.curCol = 0;
+                    this.currentFgMuted = false;
                     i += 2;
                     continue;
                 }
@@ -132,6 +161,10 @@ class ScreenBuffer {
                 const padded = row.padEnd(this.curCol + 1, " ");
                 this.rows[this.curRow] =
                     padded.slice(0, this.curCol) + ch + padded.slice(this.curCol + 1);
+                // Track Qwen's internal reasoning: ✦ printed in the muted gray color.
+                if (ch === "\u2726") {
+                    this.rowReasoning[this.curRow] = this.currentFgMuted;
+                }
                 this.curCol = Math.min(this.curCol + 1, this.width - 1);
             }
             i += 1;
@@ -142,8 +175,10 @@ class ScreenBuffer {
     }
     reset() {
         this.rows = Array.from({ length: this.height }, () => "");
+        this.rowReasoning = Array.from({ length: this.height }, () => false);
         this.curRow = 0;
         this.curCol = 0;
+        this.currentFgMuted = false;
     }
 }
 function sanitizePtyEnv(extra = {}) {
@@ -158,6 +193,12 @@ function sanitizePtyEnv(extra = {}) {
     }
     return env;
 }
+function buildPromptWithAttachments(prompt, attachments) {
+    if (!attachments || attachments.length === 0)
+        return prompt;
+    const refs = attachments.map((p) => `@${p}`).join(" ");
+    return `${refs} ${prompt}`;
+}
 export class QwenRunner extends EventEmitter {
     provider = "qwen";
     sessions = new Map();
@@ -168,7 +209,8 @@ export class QwenRunner extends EventEmitter {
         return super.emit(event, ...args);
     }
     startSession(options) {
-        const { sessionId, projectPath, prompt, modelName, reasoningEffort, approvalMode, providerSessionId, timeoutMs = 0, } = options;
+        const { sessionId, projectPath, modelName, reasoningEffort, approvalMode, providerSessionId, timeoutMs = 0, attachments, } = options;
+        const prompt = buildPromptWithAttachments(options.prompt, attachments);
         let timer = null;
         if (timeoutMs > 0) {
             timer = setTimeout(() => {
@@ -195,6 +237,8 @@ export class QwenRunner extends EventEmitter {
             providerSessionId: providerSessionId ?? sessionId,
             awaitingApproval: false,
             lastApprovalSignature: null,
+            lastResolvedApprovalSignature: null,
+            lastApprovalResolvedAt: 0,
             requestCounter: 0,
             ptyTracePath: null,
             ptyTraceStream: null,
@@ -206,13 +250,16 @@ export class QwenRunner extends EventEmitter {
             emittedAssistantText: "",
             assistantEmitTimer: null,
             lastThinkingLabel: null,
+            lastActionTitle: null,
+            lastActionMessage: null,
         };
         this.ensureTrace(entry);
         this.sessions.set(sessionId, entry);
         this.launchProcess(entry, prompt, false);
     }
     resumeSession(options) {
-        const { sessionId, projectPath, prompt, modelName, reasoningEffort, approvalMode, providerSessionId, } = options;
+        const { sessionId, projectPath, modelName, reasoningEffort, approvalMode, providerSessionId, attachments, } = options;
+        const prompt = buildPromptWithAttachments(options.prompt, attachments);
         const entry = {
             id: sessionId,
             prompt,
@@ -232,6 +279,8 @@ export class QwenRunner extends EventEmitter {
             providerSessionId: providerSessionId ?? sessionId,
             awaitingApproval: false,
             lastApprovalSignature: null,
+            lastResolvedApprovalSignature: null,
+            lastApprovalResolvedAt: 0,
             requestCounter: 0,
             ptyTracePath: null,
             ptyTraceStream: null,
@@ -243,6 +292,8 @@ export class QwenRunner extends EventEmitter {
             emittedAssistantText: "",
             assistantEmitTimer: null,
             lastThinkingLabel: null,
+            lastActionTitle: null,
+            lastActionMessage: null,
         };
         this.ensureTrace(entry);
         this.sessions.set(sessionId, entry);
@@ -273,6 +324,8 @@ export class QwenRunner extends EventEmitter {
             };
         }
         entry.awaitingApproval = false;
+        entry.lastResolvedApprovalSignature = entry.lastApprovalSignature;
+        entry.lastApprovalResolvedAt = Date.now();
         entry.lastApprovalSignature = null;
         entry.pendingRequestId = null;
         const option = entry.pendingOptions[optionIndex];
@@ -332,6 +385,7 @@ export class QwenRunner extends EventEmitter {
             entry.pty.write(`${response}\r`);
         }
         entry.pendingOptions = [];
+        entry.screen.reset();
         if (entry.status === "busy") {
             entry.status = "running";
             this.emit("status", sessionId, "running");
@@ -339,7 +393,7 @@ export class QwenRunner extends EventEmitter {
         log.debug(`${ts()} respondToSession: cleared pendingOptions, returning true`);
         return { ok: true };
     }
-    inputToSession(sessionId, text, modelName, _planMode, reasoningEffort, approvalMode, _attachments) {
+    inputToSession(sessionId, text, modelName, _planMode, reasoningEffort, approvalMode, attachments) {
         const entry = this.sessions.get(sessionId);
         if (!entry) {
             return false;
@@ -373,8 +427,9 @@ export class QwenRunner extends EventEmitter {
         if (!entry.pty) {
             return false;
         }
-        this.writeTrace(entry, "pty-input", { text });
-        entry.pty.write(`${text}\r`);
+        const fullText = buildPromptWithAttachments(text, attachments);
+        this.writeTrace(entry, "pty-input", { text: fullText });
+        entry.pty.write(`${fullText}\r`);
         return true;
     }
     cancelSession(sessionId) {
@@ -445,8 +500,18 @@ export class QwenRunner extends EventEmitter {
         return true;
     }
     killAll() {
-        for (const [id] of this.sessions) {
-            this.cancelSession(id);
+        for (const [id, entry] of this.sessions) {
+            if (entry.pty === null) {
+                // No active process — session already exited, clean up silently without emitting cancel.
+                if (entry.timeout)
+                    clearTimeout(entry.timeout);
+                if (entry.idleCompletionTimer)
+                    clearTimeout(entry.idleCompletionTimer);
+                this.sessions.delete(id);
+            }
+            else {
+                this.cancelSession(id);
+            }
         }
     }
     launchProcess(entry, prompt, resume) {
@@ -671,6 +736,9 @@ export class QwenRunner extends EventEmitter {
         }
         return (/^(?:approval|permission)\s+required$/i.test(line) ||
             /^apply\s+this\s+change\??$/i.test(line) ||
+            /^\??\s*for shortcuts\b/i.test(line) ||
+            /^type your message(?:\s+or\s+@path\/to\/file)?$/i.test(line) ||
+            /^\d+(?:\.\d+)?%\s+context used$/i.test(line) ||
             /^waiting\s+for\s+(?:approval|user|confirmation)/i.test(line) ||
             /^(?:thinking|analyzing|reasoning|working|loading|searching|mining)\b/i.test(line) ||
             /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(line));
@@ -694,6 +762,204 @@ export class QwenRunner extends EventEmitter {
         return (/\b(?:successful|successfully|completed|done|finished|imported|added|removed|updated|created|fixed)\b/i.test(line) ||
             /^the\s+(?:edit|change|component|file)\s+/i.test(line) ||
             /^i(?:'| )?ve\s+/i.test(line));
+    }
+    isTransientStatusText(text) {
+        const normalized = this.normalizeApprovalLine(text);
+        if (!normalized) {
+            return false;
+        }
+        const looksLikeStandaloneStatusPhrase = !/[.!?]$/.test(normalized) &&
+            normalized.split(/\s+/).length <= 8 &&
+            /^(?:[A-Z][a-z]+ing|[a-z]+ing)\b/.test(normalized) &&
+            !/\b(?:component|function|variable|class|import|export|file|code|error)\b/i.test(normalized);
+        return (/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(normalized) ||
+            /\([^)]*\d+\s*s[^)]*\)/i.test(normalized) ||
+            /\b\d+\s*s\b/i.test(normalized) ||
+            /\u2026|\.{3}/.test(normalized) ||
+            looksLikeStandaloneStatusPhrase ||
+            /^(just a moment|one moment|finding|searching|looking|checking|reading|opening|locating|reviewing|analyzing|analysing|updating|loading|preparing|scanning|inspecting|exploring|optimizing|optimising|compiling|painting|polishing|tuning|stitching|untangling)\b/i.test(normalized));
+    }
+    cleanBoxInnerLine(line) {
+        return line
+            .replace(/^\s*│\s?/, "")
+            .replace(/\s?│\s*$/, "")
+            .replace(/\s+$/, "");
+    }
+    extractSurroundingBoxLines(lines, centerIndex) {
+        let top = -1;
+        for (let i = centerIndex; i >= Math.max(0, centerIndex - 30); i -= 1) {
+            if (/^\s*╭/.test(lines[i] ?? "")) {
+                top = i;
+                break;
+            }
+        }
+        if (top < 0) {
+            return null;
+        }
+        let bottom = -1;
+        for (let i = centerIndex; i < Math.min(lines.length, centerIndex + 40); i += 1) {
+            if (/^\s*╰/.test(lines[i] ?? "")) {
+                bottom = i;
+                break;
+            }
+        }
+        if (bottom < 0 || bottom <= top) {
+            return null;
+        }
+        return lines.slice(top + 1, bottom).map((line) => this.cleanBoxInnerLine(line));
+    }
+    extractCodePreviewFromBox(lines, toolLineIndex, tool, args, filePath) {
+        const innerLines = this.extractSurroundingBoxLines(lines, toolLineIndex);
+        if (!innerLines || innerLines.length === 0) {
+            return null;
+        }
+        const toolLineIndexInBox = innerLines.findIndex((line) => {
+            const normalized = this.normalizeApprovalLine(line);
+            return normalized.includes(tool) && normalized.includes(filePath);
+        });
+        if (toolLineIndexInBox < 0) {
+            return null;
+        }
+        const previewLines = [];
+        for (let i = toolLineIndexInBox + 1; i < innerLines.length; i += 1) {
+            const raw = innerLines[i];
+            const normalized = this.normalizeApprovalLine(raw);
+            if (!normalized) {
+                if (previewLines.length > 0) {
+                    break;
+                }
+                continue;
+            }
+            if (this.isApprovalNoiseLine(normalized) ||
+                /^\s*\d+\.\s/.test(normalized) ||
+                /^Apply this change\??$/i.test(normalized) ||
+                /^(?:Grep|Glob|Shell|ReadFile|ReadFolder|ReadManyFiles|ListFiles|ListDirectory|Edit|Write|WriteFile|FindFiles|Search|SearchText|FileSystem|Bash|Run|MultiEdit|Replace|Todo|Task|Fetch|WebFetch|CreateFile)\b/.test(normalized)) {
+                break;
+            }
+            previewLines.push(raw.trim());
+        }
+        if (previewLines.length === 0) {
+            return null;
+        }
+        const diffLines = [];
+        for (const line of previewLines) {
+            const withoutPrefix = line.startsWith(`${filePath}:`)
+                ? line.slice(filePath.length + 1).trim()
+                : line.trim();
+            if (!withoutPrefix) {
+                continue;
+            }
+            if (withoutPrefix.includes("=>")) {
+                const [before, after] = withoutPrefix.split(/\s*=>\s*/, 2);
+                if (before?.trim())
+                    diffLines.push(`- ${before.trim()}`);
+                if (after?.trim())
+                    diffLines.push(`+ ${after.trim()}`);
+                continue;
+            }
+            diffLines.push(withoutPrefix);
+        }
+        const body = diffLines.join("\n").trim();
+        if (!body) {
+            return null;
+        }
+        return {
+            body,
+            metadata: {
+                tool,
+                filePath,
+                format: body.split("\n").every((line) => /^[-+]/.test(line)) ? "diff" : undefined,
+                changeDescription: args,
+                lineCount: body.split("\n").length,
+            },
+        };
+    }
+    updateLastActionContext(entry, kind, title, body, metadata) {
+        if (kind === "code") {
+            const tool = typeof metadata?.tool === "string" ? metadata.tool : "Edit";
+            const filePath = typeof metadata?.filePath === "string" ? metadata.filePath : title;
+            entry.lastActionTitle = filePath ? `${tool} ${filePath}` : tool;
+            entry.lastActionMessage = body;
+            return;
+        }
+        if (kind === "command") {
+            const tool = typeof metadata?.tool === "string" ? metadata.tool : "Command";
+            entry.lastActionTitle = `${tool}: ${body.slice(0, 140)}`;
+            entry.lastActionMessage = body;
+            return;
+        }
+        if (kind === "path") {
+            const tool = typeof metadata?.tool === "string" ? metadata.tool : "File";
+            entry.lastActionTitle = `${tool} ${body.split("\n")[0] ?? ""}`.trim();
+            entry.lastActionMessage = body;
+        }
+    }
+    approvalDisplayNeedsActionFallback(parts) {
+        const title = (parts.title ?? "").trim();
+        const messageLines = parts.message
+            .split("\n")
+            .map((line) => this.normalizeApprovalLine(line))
+            .filter(Boolean);
+        if (title && this.isApprovalActionLine(title)) {
+            return false;
+        }
+        if (messageLines.some((line) => this.isApprovalActionLine(line))) {
+            return false;
+        }
+        if (!title && /^Qwen requires confirmation$/i.test(parts.message.trim())) {
+            return true;
+        }
+        if (/^(?:approval|permission)\s+required$/i.test(title || parts.message.trim())) {
+            return true;
+        }
+        return true;
+    }
+    extractLatestActionContextFromScreen(clean) {
+        const lines = clean.split("\n");
+        const toolLineRe = /[│|]?\s*([?✓✎⊶⧖⚡✗✖✔●])\s+(Grep|Glob|Shell|ReadFile|ReadFolder|ReadManyFiles|ListFiles|ListDirectory|Edit|Write|WriteFile|FindFiles|Search|SearchText|FileSystem|Bash|Run|MultiEdit|Replace|Todo|Task|Fetch|WebFetch|CreateFile)\b([^\n]*?)(?:\s*[│|])?$/;
+        for (let i = lines.length - 1; i >= 0; i -= 1) {
+            const rawLine = lines[i];
+            const match = rawLine.match(toolLineRe);
+            if (!match)
+                continue;
+            const [, icon, tool, rawArgs] = match;
+            if (icon === "⊶" || icon === "⧖" || icon === "⚡")
+                continue;
+            const args = rawArgs
+                .trim()
+                .replace(/[←→↵]\s*$/, "")
+                .replace(/…$/, "")
+                .trim();
+            if (!args)
+                continue;
+            const editLike = /^(Edit|Write|WriteFile|MultiEdit|Replace|CreateFile)$/.test(tool);
+            const readLike = /^(ReadFile|ReadFolder|ReadManyFiles|ListFiles|ListDirectory)$/.test(tool);
+            if (editLike) {
+                const filePath = (args.match(/^([^\s:]+)/) ?? [null, args])[1] ?? args;
+                const preview = this.extractCodePreviewFromBox(lines, i, tool, args, filePath);
+                return {
+                    title: `${tool} ${filePath}`.trim(),
+                    message: preview?.body || args,
+                };
+            }
+            if (readLike) {
+                const filePath = (args.match(/^['""]?([^'""\s]+)['""]?/) ?? [null, args])[1] ?? args;
+                return {
+                    title: `${tool} ${filePath}`.trim(),
+                    message: filePath,
+                };
+            }
+            return {
+                title: `${tool}: ${args.slice(0, 140)}`.trim(),
+                message: args,
+            };
+        }
+        return null;
+    }
+    preparePromptDetectionLine(line) {
+        return this.cleanBoxInnerLine(line)
+            .replace(/\s*[←→↵]\s*$/, "")
+            .trimEnd();
     }
     buildApprovalDisplay(contextText) {
         const lines = contextText
@@ -780,12 +1046,13 @@ export class QwenRunner extends EventEmitter {
         return inner.length ? inner.join("\n") : null;
     }
     parsePrompt(text) {
-        const lines = text
+        const rawLines = text
             .replace(/\r\n/g, "\n")
             .replace(/\r/g, "\n")
             .split("\n")
             .slice(-80)
             .map((line) => line.trimEnd());
+        const lines = rawLines.map((line) => this.preparePromptDetectionLine(line));
         const optionMatcher = /^(?:\s*(?:\u203a|\u276f|>|->|\*)\s*)?(\d+)[.)]\s+(.+?)(?:\s+\(([\w-]+)\))?\s*$/;
         const hasCursorPrefix = (line) => /^\s*(?:\u203a|\u276f|>|->|\*)\s*/.test(line);
         const isDescriptionLine = (line) => {
@@ -906,7 +1173,7 @@ export class QwenRunner extends EventEmitter {
         if (!looksInteractive) {
             return null;
         }
-        const boxContent = this.extractApprovalBoxContent(lines, bestStart, bestEnd);
+        const boxContent = this.extractApprovalBoxContent(rawLines, bestStart, bestEnd);
         return {
             contextText: boxContent ?? contextText ?? region,
             options: bestOptions,
@@ -962,14 +1229,37 @@ export class QwenRunner extends EventEmitter {
             entry.pendingOptions = options;
             entry.pendingRequestId = null;
             entry.awaitingApproval = false;
+            entry.lastResolvedApprovalSignature = entry.lastApprovalSignature;
+            entry.lastApprovalResolvedAt = Date.now();
             entry.lastApprovalSignature = null;
             this.respondToDetectedApproval(entry, 0);
             return;
         }
         const textParts = this.extractApprovalTextParts(message);
-        const signature = `${textParts.title ?? ""}::${textParts.message}::${options
+        const screenActionContext = this.extractLatestActionContextFromScreen(entry.screen.getScreen());
+        const finalTextParts = this.approvalDisplayNeedsActionFallback(textParts) &&
+            (screenActionContext?.title || entry.lastActionTitle)
+            ? {
+                title: screenActionContext?.title ?? entry.lastActionTitle,
+                message: textParts.message.trim() &&
+                    !/^(?:approval|permission)\s+required$/i.test(textParts.message.trim()) &&
+                    textParts.message.trim() !== (screenActionContext?.title ?? entry.lastActionTitle)
+                    ? textParts.message
+                    : screenActionContext?.message ??
+                        entry.lastActionMessage ??
+                        entry.lastActionTitle ??
+                        "Qwen requires confirmation",
+            }
+            : textParts;
+        const signature = `${finalTextParts.title ?? ""}::${finalTextParts.message}::${options
             .map((option) => `${option.index}:${option.label}:${option.shortcutKey ?? ""}`)
             .join("|")}`;
+        const recentlyResolvedSameApproval = entry.lastResolvedApprovalSignature === signature &&
+            Date.now() - entry.lastApprovalResolvedAt < 5_000;
+        if (recentlyResolvedSameApproval) {
+            log.debug(`${ts()} suppressing duplicate approval redraw`);
+            return;
+        }
         if (entry.awaitingApproval && entry.lastApprovalSignature === signature) {
             return;
         }
@@ -981,7 +1271,7 @@ export class QwenRunner extends EventEmitter {
         entry.lastApprovalSignature = signature;
         entry.status = "busy";
         this.emit("status", entry.id, "busy");
-        this.emit("approval", entry.id, entry.pendingRequestId, textParts.title, textParts.message, options);
+        this.emit("approval", entry.id, entry.pendingRequestId, finalTextParts.title, finalTextParts.message, options);
     }
     respondToDetectedApproval(entry, optionIndex) {
         if (!entry.pty) {
@@ -1042,6 +1332,7 @@ export class QwenRunner extends EventEmitter {
         return this.buildApprovalDisplay(contextText);
     }
     emitBlock(entry, kind, title, body, metadata) {
+        this.updateLastActionContext(entry, kind, title, body, metadata);
         const block = {
             kind,
             body,
@@ -1082,7 +1373,8 @@ export class QwenRunner extends EventEmitter {
         // Pattern: "│ ✓  ToolName args…" inside boxes.
         // We only emit on completed icons (✓ ✎ ✔ ✗ ✖), not in-progress (⊶ ⧖ ⚡).
         const toolLineRe = /[│|]\s*([✓✎⊶⧖⚡✗✖✔●])\s+(Grep|Glob|Shell|ReadFile|ReadFolder|ReadManyFiles|ListFiles|ListDirectory|Edit|Write|WriteFile|FindFiles|Search|SearchText|FileSystem|Bash|Run|MultiEdit|Replace|Todo|Task|Fetch|WebFetch|CreateFile)\b([^\n]*?)(?:\s*[│|])?$/;
-        for (const rawLine of lines) {
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+            const rawLine = lines[lineIndex];
             const match = rawLine.match(toolLineRe);
             if (!match)
                 continue;
@@ -1100,7 +1392,8 @@ export class QwenRunner extends EventEmitter {
             const readLike = /^(ReadFile|ReadFolder|ReadManyFiles|ListFiles|ListDirectory)$/.test(tool);
             if (editLike) {
                 const filePath = (args.match(/^([^\s:]+)/) ?? [null, args])[1];
-                this.emitBlock(entry, "code", filePath, args, { tool, filePath });
+                const preview = this.extractCodePreviewFromBox(lines, lineIndex, tool, args, filePath);
+                this.emitBlock(entry, "code", filePath, preview?.body ?? args, preview?.metadata ?? { tool, filePath, changeDescription: args });
             }
             else if (readLike) {
                 const filePath = (args.match(/^['""]?([^'""\s]+)['""]?/) ?? [null, args])[1];
@@ -1114,7 +1407,7 @@ export class QwenRunner extends EventEmitter {
         // The screen may show multiple ✦ blocks (chat history). Each is a separate
         // text block. We collect all of them, track the longest capture per prefix
         // key, and emit each once after 3s of stability.
-        const assistantBlocks = this.collectAssistantBlocks(lines);
+        const assistantBlocks = this.collectAssistantBlocks(lines, entry);
         for (const text of assistantBlocks) {
             if (!text || entry.emittedTextBodies.has(text))
                 continue;
@@ -1177,12 +1470,38 @@ export class QwenRunner extends EventEmitter {
      * Collect all ✦-prefixed text blocks from screen lines.
      * Each block starts at a ✦ line and continues with indented continuation lines.
      */
-    collectAssistantBlocks(lines) {
+    collectAssistantBlocks(lines, entry) {
         const blocks = [];
         let i = 0;
         while (i < lines.length) {
             const line = lines[i];
             if (/^\s{0,4}✦\s+/.test(line)) {
+                // Skip Qwen's internal reasoning blocks (✦ printed in muted gray).
+                if (entry.screen.isRowReasoning(i)) {
+                    i += 1;
+                    while (i < lines.length) {
+                        const next = lines[i];
+                        if (!next || next.trim() === "")
+                            break;
+                        if (/^\s{0,4}✦\s+/.test(next))
+                            break;
+                        if (/^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(next))
+                            break;
+                        if (/^[─━]{5,}/.test(next.trim()))
+                            break;
+                        if (/^[╭╮╯╰│]/.test(next.trim()))
+                            break;
+                        if (/^[>│]/.test(next.trim()))
+                            break;
+                        if (/^\s{4}/.test(next)) {
+                            i += 1;
+                        }
+                        else {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 const collected = [];
                 const startLine = line.replace(/^\s{0,4}✦\s+/, "").trimEnd();
                 if (startLine)
