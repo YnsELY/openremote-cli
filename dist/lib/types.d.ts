@@ -10,7 +10,7 @@ export interface AppConfig {
 }
 export type MachineAvailabilityState = "offline" | "idle" | "busy" | "revoked";
 export type AgentProvider = "codex" | "qwen" | "claude";
-export type SessionStatus = "queued" | "running" | "busy" | "idle" | "completed" | "failed" | "cancelled";
+export type SessionStatus = "queued" | "running" | "idle" | "completed" | "failed" | "cancelled";
 export interface ParsedOption {
     index: number;
     label: string;

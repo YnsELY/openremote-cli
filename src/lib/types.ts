@@ -24,7 +24,6 @@ export type AgentProvider = "codex" | "qwen" | "claude";
 export type SessionStatus =
   | "queued"
   | "running"
-  | "busy"
   | "idle"
   | "completed"
   | "failed"
@@ -82,7 +81,7 @@ export interface SessionErrorMsg {
 }
 
 export interface SessionBusyMsg {
-  type: "session:busy";
+  type: "session:busy"; // legacy — treated as "running"
   payload: { sessionId: string };
 }
 

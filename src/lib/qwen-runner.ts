@@ -476,9 +476,8 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
 
     entry.pendingOptions = [];
     entry.screen.reset();
-    if (entry.status === "busy") {
-      entry.status = "running";
-      this.emit("status", sessionId, "running");
+    if (entry.status === "running") {
+      // already running — no change needed
     }
     log.debug(`${ts()} respondToSession: cleared pendingOptions, returning true`);
     return { ok: true };
@@ -1534,8 +1533,8 @@ export class QwenRunner extends EventEmitter implements ProviderRunner {
     entry.pendingRequestId = `${entry.id}-approval-${entry.requestCounter}`;
     entry.awaitingApproval = true;
     entry.lastApprovalSignature = signature;
-    entry.status = "busy";
-    this.emit("status", entry.id, "busy");
+    entry.status = "running";
+    this.emit("status", entry.id, "running");
     this.emit(
       "approval",
       entry.id,

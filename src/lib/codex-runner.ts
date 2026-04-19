@@ -247,7 +247,7 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       return false;
     }
 
-    if (entry.activeTurnId || entry.status === "running" || entry.status === "busy") {
+    if (entry.activeTurnId || entry.status === "running") {
       this.emit(
         "error",
         sessionId,
@@ -775,7 +775,7 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       },
     });
 
-    this.setStatus(entry, "busy");
+    this.setStatus(entry, "running");
     this.emit("approval", entry.id, requestId, "Command approval", lines.join("\n"), options);
   }
 
@@ -804,7 +804,7 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       },
     });
 
-    this.setStatus(entry, "busy");
+    this.setStatus(entry, "running");
     this.emit("approval", entry.id, requestId, "File change approval", lines.join("\n"), options);
   }
 
@@ -841,7 +841,7 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       permissions.fileSystem ? "File system access requested." : null,
     ].filter((line): line is string => Boolean(line));
 
-    this.setStatus(entry, "busy");
+    this.setStatus(entry, "running");
     this.emit("approval", entry.id, requestId, "Permissions approval", lines.join("\n"), options);
   }
 
@@ -901,7 +901,7 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
       },
     });
 
-    this.setStatus(entry, "busy");
+    this.setStatus(entry, "running");
     this.emit(
       "approval",
       entry.id,

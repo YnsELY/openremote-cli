@@ -335,8 +335,7 @@ export class ClaudeRunner extends EventEmitter {
                     return;
                 // Only finalize if session is still active
                 if (entry.status === "running" ||
-                    entry.status === "queued" ||
-                    entry.status === "busy") {
+                    entry.status === "queued") {
                     if (code === 0) {
                         this.setStatus(entry, "idle");
                     }
@@ -462,7 +461,17 @@ export class ClaudeRunner extends EventEmitter {
                 const filePath = input?.file_path ?? "";
                 const oldStr = input?.old_string ?? "";
                 const newStr = input?.new_string ?? "";
-                const body = `--- ${filePath}\n- ${oldStr}\n+ ${newStr}`;
+                const prefixLines = (text, prefix) => text.length === 0
+                    ? ""
+                    : text.split("\n").map((line) => prefix + line).join("\n");
+                const oldBlock = prefixLines(oldStr, "-");
+                const newBlock = prefixLines(newStr, "+");
+                const body = [
+                    `--- ${filePath}`,
+                    `+++ ${filePath}`,
+                    ...(oldBlock ? [oldBlock] : []),
+                    ...(newBlock ? [newBlock] : []),
+                ].join("\n");
                 const oldLines = oldStr ? oldStr.split("\n").length : 0;
                 const newLines = newStr ? newStr.split("\n").length : 0;
                 const changeDescription = oldStr === "" && newStr !== ""
@@ -637,7 +646,7 @@ export class ClaudeRunner extends EventEmitter {
         ];
         log.debug(`${ts()} Raising permission approval for session ${entry.id}`);
         this.traceEvent(entry, "permission-approval", { requestId, message });
-        this.setStatus(entry, "busy");
+        this.setStatus(entry, "running");
         this.emit("approval", entry.id, requestId, "Permissions requises", message, options);
     }
     /* ------------------------------------------------------------------ */

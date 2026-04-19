@@ -161,6 +161,13 @@ export class Bridge extends EventEmitter {
 
       await this.client.realtime.setAuth(accessToken);
 
+      // Fire the first heartbeat immediately — don't wait for the channel to be
+      // SUBSCRIBED. This makes the "machine online" broadcast reach clients as
+      // soon as the token is ready, in parallel with the WebSocket handshake.
+      void this.sendHeartbeat("idle").catch((err) => {
+        log.debug(`Early heartbeat failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+
       this.machineChannel = this.client.channel(machineTopic(this.config.machineId), {
         config: {
           private: false,
@@ -193,7 +200,6 @@ export class Bridge extends EventEmitter {
 
       this.reconnectDelay = 1000;
       this.emit("connected");
-      await this.sendHeartbeat("idle");
       this.startHeartbeatLoop();
       this.emit("ready");
     } catch (error) {
@@ -302,21 +308,13 @@ export class Bridge extends EventEmitter {
       case "session:busy":
         {
           const state = this.getSessionState(msg.payload.sessionId);
-          state.lastStatus = "busy";
+          state.lastStatus = "running";
           this.machineState = this.recomputeMachineState();
           const occurredAt = nowIso();
-          const readableBlock = makeReadableStatusBlock(
-            state.readableSeq++,
-            "busy",
-            occurredAt,
-            "Machine occupee",
-          );
           await this.ingest(msg.payload.sessionId, {
             events: [this.makeEvent(msg.type, msg.payload.sessionId, msg.payload)],
-            readableBlocks: [readableBlock],
             sessionPatch: {
-              status: "busy",
-              completedAt: occurredAt,
+              status: "running",
             },
             machineState: this.machineState,
           });
@@ -481,8 +479,7 @@ export class Bridge extends EventEmitter {
     for (const state of this.sessions.values()) {
       if (
         state.lastStatus === "queued" ||
-        state.lastStatus === "running" ||
-        state.lastStatus === "busy"
+        state.lastStatus === "running"
       ) {
         return "busy";
       }

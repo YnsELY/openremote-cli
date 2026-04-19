@@ -99,7 +99,7 @@ export class SessionManager {
     getActiveSessionCount() {
         let count = 0;
         for (const status of this.sessionStatuses.values()) {
-            if (status === "queued" || status === "running" || status === "busy") {
+            if (status === "queued" || status === "running") {
                 count += 1;
             }
         }
@@ -329,16 +329,6 @@ export class SessionManager {
                     log.ok("Session completed");
                     log.step("Waiting for the next prompt");
                 }
-                else if (status === "busy") {
-                    log.setDashboard({
-                        sessionId: `${sid.slice(0, 8)}...`,
-                        sessionState: "approval",
-                        sessionDetail: "Waiting for approval",
-                        providerName: providerLabel(provider),
-                    });
-                    log.infoBar("Approval required to continue.", "warning");
-                    log.step("Approval required");
-                }
                 else if (status === "queued") {
                     log.setDashboard({
                         sessionId: `${sid.slice(0, 8)}...`,
@@ -482,7 +472,7 @@ export class SessionManager {
     }
     hasBusySessions() {
         for (const status of this.sessionStatuses.values()) {
-            if (status === "queued" || status === "running" || status === "busy") {
+            if (status === "queued" || status === "running") {
                 return true;
             }
         }

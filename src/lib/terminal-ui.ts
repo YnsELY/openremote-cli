@@ -437,7 +437,7 @@ export class TerminalUI {
     const isConnected = ["connected", "online"].includes(
       this.dashboard.machineStatus.toLowerCase(),
     );
-    const isBusyOrIdle = ["busy", "idle"].includes(
+    const isBusyOrIdle = ["idle"].includes(
       this.dashboard.machineStatus.toLowerCase(),
     );
     const isActive = isConnected || isBusyOrIdle;

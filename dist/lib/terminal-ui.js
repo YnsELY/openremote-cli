@@ -353,7 +353,7 @@ export class TerminalUI {
         if (!this.dashboard)
             return "";
         const isConnected = ["connected", "online"].includes(this.dashboard.machineStatus.toLowerCase());
-        const isBusyOrIdle = ["busy", "idle"].includes(this.dashboard.machineStatus.toLowerCase());
+        const isBusyOrIdle = ["idle"].includes(this.dashboard.machineStatus.toLowerCase());
         const isActive = isConnected || isBusyOrIdle;
         const dot = isActive ? chalk.greenBright("●") : chalk.yellow("○");
         const title = isActive ? "Machine connected" : "Machine status";

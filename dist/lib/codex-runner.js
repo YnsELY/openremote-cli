@@ -154,7 +154,7 @@ export class CodexRunner extends EventEmitter {
         if (!entry || !entry.providerSessionId) {
             return false;
         }
-        if (entry.activeTurnId || entry.status === "running" || entry.status === "busy") {
+        if (entry.activeTurnId || entry.status === "running") {
             this.emit("error", sessionId, "Codex is already working on this session. Wait for the current turn to finish.");
             return false;
         }
@@ -602,7 +602,7 @@ export class CodexRunner extends EventEmitter {
                 });
             },
         });
-        this.setStatus(entry, "busy");
+        this.setStatus(entry, "running");
         this.emit("approval", entry.id, requestId, "Command approval", lines.join("\n"), options);
     }
     raiseFileChangeApproval(entry, id, params) {
@@ -623,7 +623,7 @@ export class CodexRunner extends EventEmitter {
                 this.client.respond(id, { decision: decisions[optionIndex] });
             },
         });
-        this.setStatus(entry, "busy");
+        this.setStatus(entry, "running");
         this.emit("approval", entry.id, requestId, "File change approval", lines.join("\n"), options);
     }
     raisePermissionApproval(entry, id, params) {
@@ -650,7 +650,7 @@ export class CodexRunner extends EventEmitter {
             permissions.network ? "Network access requested." : null,
             permissions.fileSystem ? "File system access requested." : null,
         ].filter((line) => Boolean(line));
-        this.setStatus(entry, "busy");
+        this.setStatus(entry, "running");
         this.emit("approval", entry.id, requestId, "Permissions approval", lines.join("\n"), options);
     }
     raiseUserInputRequest(entry, id, params) {
@@ -692,7 +692,7 @@ export class CodexRunner extends EventEmitter {
                 });
             },
         });
-        this.setStatus(entry, "busy");
+        this.setStatus(entry, "running");
         this.emit("approval", entry.id, requestId, typeof question.header === "string" ? question.header : "Question", typeof question.question === "string"
             ? question.question
             : "Codex requires your input to continue.", options);
