@@ -47,6 +47,14 @@ You only need **one** of the three agents — the CLI will detect which ones are
 
 ## Installation
 
+### Option 1 — Install from npm (recommended)
+
+```bash
+npm install -g openremote
+```
+
+### Option 2 — Build from source
+
 Clone the repository and install the CLI dependencies:
 
 ```bash
