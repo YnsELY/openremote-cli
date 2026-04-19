@@ -1,6 +1,6 @@
 <div align="center">
   <img src="assets/screenshots/logo.png" alt="Codex Remote Logo" width="400" />
-  <h1>Codex Remote — CLI</h1>
+  <h1>OpenRemote — CLI</h1>
   <p><strong>Control your AI coding agent from your iPhone.</strong></p>
   <p>Run Codex, Qwen, or Claude on your machine and pilot every session remotely from the Codex Remote mobile app.</p>
 </div>
