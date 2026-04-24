@@ -22,6 +22,12 @@ export declare class ClaudeRunner extends EventEmitter implements ProviderRunner
     private handleJsonLine;
     private handleSystemEvent;
     private handleAssistantEvent;
+    /**
+     * For sub-agent events (parent_tool_use_id set): only surface Edit and Write
+     * tool calls so the user can see which files were actually modified. All
+     * other blocks (text, thinking, Bash, Read, Glob, …) are suppressed.
+     */
+    private handleSubAgentAssistantEvent;
     private handleToolUseBlock;
     private handleUserEvent;
     private handleResultEvent;

@@ -250,6 +250,7 @@ export class SessionManager {
             log.clearInfoBar();
             this.sessionProviders.set(payload.sessionId, provider);
             this.sessionStatuses.set(payload.sessionId, "queued");
+            this.bridge.registerSessionProvider(payload.sessionId, provider);
             runner.resumeSession({
                 sessionId: payload.sessionId,
                 projectPath: payload.projectPath,
@@ -294,6 +295,9 @@ export class SessionManager {
                 continue;
             }
             runner.on("output", (sid, data) => {
+                if (provider === "claude") {
+                    return;
+                }
                 this.bridge.send({
                     type: "session:output",
                     payload: { sessionId: sid, data, timestamp: Date.now() },
@@ -377,7 +381,7 @@ export class SessionManager {
                     payload: { sessionId: sid, status },
                 });
             });
-            runner.on("approval", (sid, requestId, title, message, options) => {
+            runner.on("approval", (sid, requestId, title, message, options, kind) => {
                 log.setDashboard({
                     sessionId: `${sid.slice(0, 8)}...`,
                     sessionState: "approval",
@@ -392,9 +396,11 @@ export class SessionManager {
                         title: title ?? undefined,
                         provider,
                         message,
+                        kind: kind ?? "permission",
                         options: options.map((option) => ({
                             label: option.label,
                             index: option.index,
+                            ...(option.description ? { description: option.description } : {}),
                         })),
                     },
                 });

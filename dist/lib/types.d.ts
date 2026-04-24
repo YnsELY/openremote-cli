@@ -15,6 +15,7 @@ export interface ParsedOption {
     index: number;
     label: string;
     shortcutKey: string | null;
+    description?: string;
 }
 export interface MachineHelloMsg {
     type: "machine:hello";
@@ -52,9 +53,11 @@ export interface SessionApprovalMsg {
         title?: string;
         provider: AgentProvider;
         message: string;
+        kind?: "permission" | "ask";
         options: {
             label: string;
             index: number;
+            description?: string;
         }[];
     };
 }
@@ -171,7 +174,7 @@ export interface SessionIngestOutputSegment {
 }
 export type SessionReadableBlockKind = "thinking" | "command" | "output" | "text" | "code" | "path" | "error" | "status";
 export interface SessionReadableBlockIngest {
-    seq: number;
+    seq?: number;
     kind: SessionReadableBlockKind;
     title?: string;
     body: string;
@@ -195,7 +198,7 @@ export interface RunnerEvents {
     error: (sessionId: string, error: string) => void;
     status: (sessionId: string, status: SessionStatus) => void;
     complete: (sessionId: string, exitCode: number, duration: number) => void;
-    approval: (sessionId: string, requestId: string, title: string | null, message: string, options: ParsedOption[]) => void;
+    approval: (sessionId: string, requestId: string, title: string | null, message: string, options: ParsedOption[], kind?: "permission" | "ask") => void;
     providerSession: (sessionId: string, providerSessionId: string) => void;
     sessionLog: (sessionId: string, tracePath: string) => void;
 }

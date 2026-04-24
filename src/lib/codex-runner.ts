@@ -334,12 +334,20 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
   }
 
   killAll(): void {
-    for (const [sessionId] of this.sessions) {
-      this.cancelSession(sessionId);
+    for (const [sessionId, entry] of Array.from(this.sessions.entries())) {
+      if (entry.status === "running" || entry.status === "queued" || entry.activeTurnId !== null) {
+        this.cancelSession(sessionId);
+      } else {
+        // Idle session — clean up resources without marking it cancelled in the DB.
+        if (entry.timeout) {
+          clearTimeout(entry.timeout);
+          entry.timeout = null;
+        }
+        this.closeTrace(entry);
+        this.sessions.delete(sessionId);
+      }
     }
-    if (this.sessions.size === 0) {
-      void this.client.stop();
-    }
+    void this.client.stop();
   }
 
   private createSessionEntry(
@@ -572,7 +580,7 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
 
         const role = asString(item.role);
         const phase = asString(item.phase);
-        if (role !== "assistant" || phase !== "final_answer") {
+        if (role !== "assistant" || (phase !== "final_answer" && phase !== "commentary")) {
           return;
         }
 
@@ -587,12 +595,14 @@ export class CodexRunner extends EventEmitter implements ProviderRunner {
           return;
         }
 
-        this.clearTransientStates(entry);
+        if (phase === "final_answer") {
+          this.clearTransientStates(entry);
+        }
         this.emitReadableBlock(entry, {
           kind: "text",
           body: text,
           metadata: {
-            phase: "final_answer",
+            phase,
           },
         });
         return;

@@ -568,7 +568,6 @@ function appendGroupedBlock(grouped: ClassifiedLine[], candidate: ClassifiedLine
 
 export function deriveReadableBlocksFromChunk(
   text: string,
-  seqStart: number,
   occurredAt: string,
   options?: { final?: boolean },
 ): DerivedReadableBlocksResult {
@@ -603,8 +602,7 @@ export function deriveReadableBlocksFromChunk(
   }
 
   return {
-    blocks: grouped.map((block, index) => ({
-      seq: seqStart + index,
+    blocks: grouped.map((block) => ({
       kind: block.kind,
       title: block.title,
       body: block.body.trim(),
@@ -615,13 +613,11 @@ export function deriveReadableBlocksFromChunk(
 }
 
 export function makeReadableStatusBlock(
-  seq: number,
   status: string,
   occurredAt: string,
   body?: string,
 ): SessionReadableBlockIngest {
   return {
-    seq,
     kind: status === "failed" || status === "cancelled" ? "error" : "status",
     title: "Status",
     body: body ? `${status} - ${body}` : status,
@@ -630,12 +626,10 @@ export function makeReadableStatusBlock(
 }
 
 export function makeReadableErrorBlock(
-  seq: number,
   error: string,
   occurredAt: string,
 ): SessionReadableBlockIngest {
   return {
-    seq,
     kind: "error",
     title: "Error",
     body: sanitizeTerminalText(error) || error,
@@ -644,12 +638,10 @@ export function makeReadableErrorBlock(
 }
 
 export function makeReadableApprovalBlock(
-  seq: number,
   message: string,
   occurredAt: string,
 ): SessionReadableBlockIngest {
   return {
-    seq,
     kind: "status",
     title: "Approval",
     body: sanitizeTerminalText(message) || message,

@@ -47,7 +47,6 @@ interface SessionState {
   provider: AgentProvider | null;
   eventSeq: number;
   outputSeq: number;
-  readableSeq: number;
   readableRemainder: string;
   lastStatus: SessionStatus | null;
   output: SessionBuffer;
@@ -136,7 +135,16 @@ export class Bridge extends EventEmitter {
   send(msg: OutboundMessage): void {
     void this.handleOutboundMessage(msg).catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
-      log.debug(`Failed to send bridge message: ${message}`);
+      // Surface at warn level so ingest failures that would otherwise drop
+      // readable blocks are visible without --debug. Previously buried at
+      // debug, which masked silent block loss on the mobile client.
+      log.debug(`Failed to send bridge message (${msg.type}): ${message}`);
+      if (msg.type === "session:block" || msg.type === "session:status") {
+        log.note(
+          `Failed to persist ${msg.type} for session ${"sessionId" in msg.payload ? msg.payload.sessionId.slice(0, 8) : "?"}: ${message}`,
+          "warning",
+        );
+      }
     });
   }
 
@@ -240,15 +248,10 @@ export class Bridge extends EventEmitter {
         return;
 
       case "session:block": {
-        const state = this.getSessionState(msg.payload.sessionId);
         await this.ingest(msg.payload.sessionId, {
           readableBlocks: [
             {
               ...msg.payload.block,
-              seq:
-                typeof msg.payload.block.seq === "number"
-                  ? msg.payload.block.seq
-                  : state.readableSeq++,
               occurredAt: msg.payload.block.occurredAt ?? nowIso(),
             },
           ],
@@ -260,9 +263,7 @@ export class Bridge extends EventEmitter {
         this.getSessionState(msg.payload.sessionId).lastStatus = msg.payload.status;
         this.machineState = this.recomputeMachineState();
         {
-          const state = this.getSessionState(msg.payload.sessionId);
           const readableBlock = makeReadableStatusBlock(
-            state.readableSeq++,
             msg.payload.status,
             nowIso(),
           );
@@ -277,9 +278,7 @@ export class Bridge extends EventEmitter {
 
       case "session:approval":
         {
-          const state = this.getSessionState(msg.payload.sessionId);
           const readableBlock = makeReadableApprovalBlock(
-            state.readableSeq++,
             msg.payload.message,
             nowIso(),
           );
@@ -292,9 +291,7 @@ export class Bridge extends EventEmitter {
 
       case "session:error":
         {
-          const state = this.getSessionState(msg.payload.sessionId);
           const readableBlock = makeReadableErrorBlock(
-            state.readableSeq++,
             msg.payload.error,
             nowIso(),
           );
@@ -336,7 +333,6 @@ export class Bridge extends EventEmitter {
         this.machineState = this.recomputeMachineState();
         const occurredAt = nowIso();
         const readableBlock = makeReadableStatusBlock(
-          state.readableSeq++,
           finalStatus,
           occurredAt,
           `exit=${msg.payload.exitCode}, duration=${msg.payload.duration}ms`,
@@ -370,7 +366,6 @@ export class Bridge extends EventEmitter {
       provider: null,
       eventSeq: 1,
       outputSeq: 1,
-      readableSeq: 1,
       readableRemainder: "",
       lastStatus: null,
       output: {
@@ -427,15 +422,14 @@ export class Bridge extends EventEmitter {
 
     const { blocks: readableBlocks, remainder } = deriveReadableBlocksFromChunk(
       `${state.readableRemainder}${outputText}`,
-      state.readableSeq,
       occurredAt,
       { final },
     );
-    const shouldDeriveReadableBlocks = state.provider !== "codex" && state.provider !== "claude";
+    // Codex, Claude, and Qwen all emit native readable blocks from their
+    // runners. Only derive blocks from raw terminal output when the provider is
+    // unknown so legacy sessions still have a fallback transcript.
+    const shouldDeriveReadableBlocks = state.provider == null;
     state.readableRemainder = shouldDeriveReadableBlocks ? remainder : "";
-    if (shouldDeriveReadableBlocks) {
-      state.readableSeq += readableBlocks.length;
-    }
 
     const outputSegments: SessionIngestOutputSegment[] =
       outputText.length > 0

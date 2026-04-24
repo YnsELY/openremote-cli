@@ -33,6 +33,7 @@ export interface ParsedOption {
   index: number;
   label: string;
   shortcutKey: string | null;
+  description?: string;
 }
 
 // Bridge protocol (CLI <-> Backend)
@@ -66,7 +67,8 @@ export interface SessionApprovalMsg {
     title?: string;
     provider: AgentProvider;
     message: string;
-    options: { label: string; index: number }[];
+    kind?: "permission" | "ask";
+    options: { label: string; index: number; description?: string }[];
   };
 }
 
@@ -207,7 +209,7 @@ export type SessionReadableBlockKind =
   | "status";
 
 export interface SessionReadableBlockIngest {
-  seq: number;
+  seq?: number;
   kind: SessionReadableBlockKind;
   title?: string;
   body: string;
@@ -244,6 +246,7 @@ export interface RunnerEvents {
     title: string | null,
     message: string,
     options: ParsedOption[],
+    kind?: "permission" | "ask",
   ) => void;
   providerSession: (sessionId: string, providerSessionId: string) => void;
   sessionLog: (sessionId: string, tracePath: string) => void;

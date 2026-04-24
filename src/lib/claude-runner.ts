@@ -34,6 +34,14 @@ interface ClaudeSessionEntry {
   permissionRequestId: string | null;
   // Tool result correlation — maps tool_use_id → tool name for parallel calls
   toolCallMap: Map<string, string>;
+  // AskUserQuestion interactive flow
+  askUserQuestionPending: boolean;
+  askUserQuestionRequestId: string | null;
+  askUserQuestionOptions: Array<{ label: string; description?: string }>;
+  // ExitPlanMode interactive flow — shown as an approval popup
+  exitPlanModePending: boolean;
+  exitPlanModeRequestId: string | null;
+  exitPlanModePlan: string;
   // Local file paths of downloaded attachments (images)
   attachments: string[];
 }
@@ -47,9 +55,10 @@ function mapClaudeModel(name: string): string {
     case "claude-sonnet-4-6":
     case "claude-sonnet-4":
       return "claude-sonnet-4-6";
+    case "claude-opus-4-7":
     case "claude-opus-4-6":
     case "claude-opus-4":
-      return "claude-opus-4-6";
+      return "claude-opus-4-7";
     case "claude-haiku-4-5":
     case "claude-haiku-3.5":
       return "claude-haiku-4-5-20251001";
@@ -198,6 +207,46 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
     if (!entry) {
       return { ok: false, error: "Session not found." };
     }
+
+    // Handle AskUserQuestion response
+    if (entry.askUserQuestionPending && entry.askUserQuestionRequestId === requestId) {
+      entry.askUserQuestionPending = false;
+      entry.askUserQuestionRequestId = null;
+
+      const selected = entry.askUserQuestionOptions[optionIndex];
+      const answerText = selected?.label ?? String(optionIndex);
+
+      log.debug(`${ts()} AskUserQuestion answered for session ${sessionId}: "${answerText}"`);
+      entry.prompt = answerText;
+      entry.buffer = "";
+      this.spawnClaude(entry, true);
+      return { ok: true };
+    }
+
+    // Handle ExitPlanMode response
+    if (entry.exitPlanModePending && entry.exitPlanModeRequestId === requestId) {
+      entry.exitPlanModePending = false;
+      entry.exitPlanModeRequestId = null;
+      const plan = entry.exitPlanModePlan;
+      entry.exitPlanModePlan = "";
+
+      if (optionIndex === 0) {
+        // Approve → disable plan mode and ask Claude to implement the plan.
+        log.debug(`${ts()} ExitPlanMode approved for session ${sessionId}`);
+        entry.planMode = false;
+        entry.prompt = plan
+          ? `Proceed with implementing the plan you just presented:\n\n${plan}`
+          : "Proceed with implementing the plan you just presented.";
+        entry.buffer = "";
+        this.spawnClaude(entry, true);
+      } else {
+        // Keep planning → stop the session so the user can send a new prompt.
+        log.debug(`${ts()} ExitPlanMode declined for session ${sessionId}`);
+        this.finalizeSession(entry, "idle", 0);
+      }
+      return { ok: true };
+    }
+
     if (!entry.permissionPending || entry.permissionRequestId !== requestId) {
       return { ok: false, error: "No pending permission request for this session." };
     }
@@ -274,10 +323,16 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
   }
 
   killAll(): void {
-    for (const entry of this.sessions.values()) {
-      this.killProcess(entry);
+    for (const entry of Array.from(this.sessions.values())) {
+      if (entry.status === "running" || entry.status === "queued") {
+        // Active session — cancel it so the DB is updated correctly.
+        this.killProcess(entry);
+        this.finalizeSession(entry, "cancelled", 130);
+      } else {
+        // Idle session — process already exited, drop it without touching DB status.
+        this.sessions.delete(entry.id);
+      }
     }
-    this.sessions.clear();
   }
 
   /* ------------------------------------------------------------------ */
@@ -312,6 +367,12 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
       permissionPending: false,
       permissionRequestId: null,
       toolCallMap: new Map(),
+      askUserQuestionPending: false,
+      askUserQuestionRequestId: null,
+      askUserQuestionOptions: [],
+      exitPlanModePending: false,
+      exitPlanModeRequestId: null,
+      exitPlanModePlan: "",
       attachments: options.attachments ?? [],
     };
   }
@@ -389,6 +450,9 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
 
       // Stream stdout line by line
       child.stdout?.on("data", (chunk: Buffer) => {
+        // Drop late stdout from a superseded process (see close handler above).
+        if (entry.process !== child) return;
+
         const text = chunk.toString("utf-8");
         entry.buffer += text;
 
@@ -408,6 +472,7 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
 
       // Capture stderr
       child.stderr?.on("data", (chunk: Buffer) => {
+        if (entry.process !== child) return;
         const text = chunk.toString("utf-8").trim();
         if (text) {
           log.debug(`${ts()} Claude stderr: ${text}`);
@@ -417,6 +482,17 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
 
       // Process exit
       child.on("close", (code) => {
+        // If this entry has been re-spawned (follow-up prompt, approval
+        // re-spawn, etc.), entry.process now points to a newer child. The old
+        // close handler MUST NOT touch entry.buffer or entry.status — doing so
+        // would wipe the new process's in-flight stdout and mark the entry as
+        // failed even though the new run is healthy.
+        if (entry.process !== child) {
+          log.debug(`${ts()} Ignoring close of superseded Claude process (code=${code})`);
+          this.traceEvent(entry, "process-exit-superseded", { code });
+          return;
+        }
+
         log.debug(`${ts()} Claude process exited with code ${code}`);
         this.traceEvent(entry, "process-exit", { code });
 
@@ -426,8 +502,16 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
           entry.buffer = "";
         }
 
-        // If waiting for user permission response, don't finalize yet
-        if (entry.permissionPending) return;
+        // If waiting for a mobile response, don't finalize the session.
+        // Claude is intentionally stopped for these tool-driven prompts and
+        // will be resumed after the user responds.
+        if (
+          entry.permissionPending ||
+          entry.askUserQuestionPending ||
+          entry.exitPlanModePending
+        ) {
+          return;
+        }
 
         // Only finalize if session is still active
         if (
@@ -444,6 +528,10 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
       });
 
       child.on("error", (err) => {
+        if (entry.process !== child) {
+          log.debug(`${ts()} Ignoring error of superseded Claude process: ${err.message}`);
+          return;
+        }
         log.debug(`${ts()} Claude spawn error: ${err.message}`);
         this.traceEvent(entry, "spawn-error", { error: err.message });
         this.emit("error", entry.id, `Failed to spawn Claude: ${err.message}`);
@@ -484,7 +572,14 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
         this.handleSystemEvent(entry, data);
         break;
       case "assistant":
-        if (!parentToolUseId) this.handleAssistantEvent(entry, data);
+        if (!parentToolUseId) {
+          this.handleAssistantEvent(entry, data);
+        } else {
+          // Sub-agent (Agent tool): suppress internal text/thinking/commands to
+          // avoid noise, but surface Edit and Write tool calls so the user can
+          // see which files were modified.
+          this.handleSubAgentAssistantEvent(entry, data);
+        }
         break;
       case "user":
         if (!parentToolUseId) this.handleUserEvent(entry, data);
@@ -550,6 +645,30 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
           this.handleToolUseBlock(entry, block);
           break;
         }
+      }
+    }
+  }
+
+  /**
+   * For sub-agent events (parent_tool_use_id set): only surface Edit and Write
+   * tool calls so the user can see which files were actually modified. All
+   * other blocks (text, thinking, Bash, Read, Glob, …) are suppressed.
+   */
+  private handleSubAgentAssistantEvent(
+    entry: ClaudeSessionEntry,
+    data: Record<string, unknown>,
+  ): void {
+    const message = data.message as Record<string, unknown> | undefined;
+    if (!message) return;
+    const content = message.content as unknown[];
+    if (!Array.isArray(content)) return;
+
+    for (const block of content) {
+      if (!isRecord(block)) continue;
+      if (block.type !== "tool_use") continue;
+      const toolName = block.name as string;
+      if (toolName === "Edit" || toolName === "Write") {
+        this.handleToolUseBlock(entry, block);
       }
     }
   }
@@ -685,6 +804,76 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
         break;
       }
 
+      case "ExitPlanMode": {
+        const plan = (input?.plan as string) ?? "";
+        const requestId = `exit-plan-${Date.now()}`;
+
+        entry.exitPlanModePending = true;
+        entry.exitPlanModeRequestId = requestId;
+        entry.exitPlanModePlan = plan;
+        entry.toolCallMap.set(block.id as string, "ExitPlanMode");
+
+        // Stop the process so Claude doesn't keep running after the tool
+        // triggers its internal "can't exit plan mode" error.
+        this.killProcess(entry);
+
+        const options: ParsedOption[] = [
+          { index: 0, label: "Approve and implement", shortcutKey: "y" },
+          { index: 1, label: "Keep planning", shortcutKey: "n" },
+        ];
+
+        log.debug(`${ts()} ExitPlanMode raised for session ${entry.id}`);
+        this.traceEvent(entry, "exit-plan-mode", { requestId, plan });
+        this.emit(
+          "approval",
+          entry.id,
+          requestId,
+          "Exit plan mode?",
+          plan,
+          options,
+        );
+        break;
+      }
+
+      case "AskUserQuestion": {
+        const questions = Array.isArray(input?.questions) ? (input.questions as Array<Record<string, unknown>>) : [];
+        if (questions.length === 0) break;
+
+        const q = isRecord(questions[0]) ? questions[0] : {};
+        const questionText = (q.question as string) ?? "";
+        const header = (q.header as string) || "Claude asks";
+        const rawOptions = Array.isArray(q.options) ? q.options : [];
+
+        const questionOptions = rawOptions
+          .filter(isRecord)
+          .map((opt) => ({
+            label: (opt.label as string) ?? "",
+            description: typeof opt.description === "string" ? opt.description : undefined,
+          }))
+          .filter((opt) => opt.label.length > 0);
+
+        const requestId = `ask-${Date.now()}`;
+        entry.askUserQuestionPending = true;
+        entry.askUserQuestionRequestId = requestId;
+        entry.askUserQuestionOptions = questionOptions;
+        entry.toolCallMap.set(block.id as string, "AskUserQuestion");
+
+        // Kill the process so Claude doesn't continue after the tool fails
+        this.killProcess(entry);
+
+        const parsedOptions: ParsedOption[] = questionOptions.map((opt, i) => ({
+          index: i,
+          label: opt.label,
+          shortcutKey: String(i + 1),
+          description: opt.description,
+        }));
+
+        log.debug(`${ts()} AskUserQuestion raised for session ${entry.id}: ${header}`);
+        this.traceEvent(entry, "ask-user-question", { requestId, header, questionText, options: parsedOptions });
+        this.emit("approval", entry.id, requestId, header, questionText, parsedOptions, "ask");
+        break;
+      }
+
       default: {
         const inputStr = input ? JSON.stringify(input).slice(0, 300) : "";
         entry.toolCallMap.set(block.id as string, toolName);
@@ -726,6 +915,13 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
             !entry.permissionPending
           ) {
             this.raisePermissionApproval(entry, resultContent);
+            continue;
+          }
+
+          // Suppress any permission-denied tool_result once approval is already
+          // pending or granted — prevents the "Permission denied" text from
+          // appearing in the chat after the user taps Accept.
+          if (isError && isPermissionError(resultContent)) {
             continue;
           }
 
@@ -785,6 +981,14 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
         return;
       }
 
+      // Suppress permission-denied error emissions when an approval is already
+      // pending or has been granted — otherwise the user sees "Permission
+      // denied" right after tapping Accept, because Claude's final result event
+      // replays the same error text from the tool call.
+      if (isPermissionError(resultText)) {
+        return;
+      }
+
       this.emit("error", entry.id, resultText || "Unknown error");
     }
   }
@@ -833,6 +1037,13 @@ export class ClaudeRunner extends EventEmitter implements ProviderRunner {
       ...(title ? { title } : {}),
       ...(metadata ? { metadata } : {}),
     };
+    this.traceEvent(entry, "emit-block", {
+      kind,
+      title,
+      bodyPreview: body.slice(0, 120),
+      bodyLength: body.length,
+      metadata,
+    });
     this.emit("readableBlock", entry.id, block);
   }
 

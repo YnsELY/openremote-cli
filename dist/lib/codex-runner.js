@@ -222,12 +222,21 @@ export class CodexRunner extends EventEmitter {
         return true;
     }
     killAll() {
-        for (const [sessionId] of this.sessions) {
-            this.cancelSession(sessionId);
+        for (const [sessionId, entry] of Array.from(this.sessions.entries())) {
+            if (entry.status === "running" || entry.status === "queued" || entry.activeTurnId !== null) {
+                this.cancelSession(sessionId);
+            }
+            else {
+                // Idle session — clean up resources without marking it cancelled in the DB.
+                if (entry.timeout) {
+                    clearTimeout(entry.timeout);
+                    entry.timeout = null;
+                }
+                this.closeTrace(entry);
+                this.sessions.delete(sessionId);
+            }
         }
-        if (this.sessions.size === 0) {
-            void this.client.stop();
-        }
+        void this.client.stop();
     }
     createSessionEntry(options, status) {
         const timeout = options.timeoutMs && options.timeoutMs > 0
@@ -431,7 +440,7 @@ export class CodexRunner extends EventEmitter {
                 }
                 const role = asString(item.role);
                 const phase = asString(item.phase);
-                if (role !== "assistant" || phase !== "final_answer") {
+                if (role !== "assistant" || (phase !== "final_answer" && phase !== "commentary")) {
                     return;
                 }
                 const content = Array.isArray(item.content) ? item.content : [];
@@ -443,12 +452,14 @@ export class CodexRunner extends EventEmitter {
                 if (!text) {
                     return;
                 }
-                this.clearTransientStates(entry);
+                if (phase === "final_answer") {
+                    this.clearTransientStates(entry);
+                }
                 this.emitReadableBlock(entry, {
                     kind: "text",
                     body: text,
                     metadata: {
-                        phase: "final_answer",
+                        phase,
                     },
                 });
                 return;

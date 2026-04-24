@@ -451,7 +451,7 @@ function appendGroupedBlock(grouped, candidate) {
     }
     grouped.push({ ...candidate });
 }
-export function deriveReadableBlocksFromChunk(text, seqStart, occurredAt, options) {
+export function deriveReadableBlocksFromChunk(text, occurredAt, options) {
     const normalized = normalizeTerminalStream(text);
     if (!normalized.trim()) {
         return {
@@ -479,8 +479,7 @@ export function deriveReadableBlocksFromChunk(text, seqStart, occurredAt, option
         }
     }
     return {
-        blocks: grouped.map((block, index) => ({
-            seq: seqStart + index,
+        blocks: grouped.map((block) => ({
             kind: block.kind,
             title: block.title,
             body: block.body.trim(),
@@ -489,27 +488,24 @@ export function deriveReadableBlocksFromChunk(text, seqStart, occurredAt, option
         remainder,
     };
 }
-export function makeReadableStatusBlock(seq, status, occurredAt, body) {
+export function makeReadableStatusBlock(status, occurredAt, body) {
     return {
-        seq,
         kind: status === "failed" || status === "cancelled" ? "error" : "status",
         title: "Status",
         body: body ? `${status} - ${body}` : status,
         occurredAt,
     };
 }
-export function makeReadableErrorBlock(seq, error, occurredAt) {
+export function makeReadableErrorBlock(error, occurredAt) {
     return {
-        seq,
         kind: "error",
         title: "Error",
         body: sanitizeTerminalText(error) || error,
         occurredAt,
     };
 }
-export function makeReadableApprovalBlock(seq, message, occurredAt) {
+export function makeReadableApprovalBlock(message, occurredAt) {
     return {
-        seq,
         kind: "status",
         title: "Approval",
         body: sanitizeTerminalText(message) || message,

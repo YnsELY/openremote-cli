@@ -49,6 +49,15 @@ export declare class QwenRunner extends EventEmitter implements ProviderRunner {
     private extractApprovalTextParts;
     private emitBlock;
     private flushPendingAssistantText;
+    private normalizeTextGrowthCandidate;
+    private commonPrefixLength;
+    private commonSuffixLength;
+    private sharedLeadingWordCount;
+    private sharedTrailingWordCount;
+    private findPendingTextBlockKey;
+    private hasEmittedEquivalentText;
+    private setCommandActive;
+    private hasActiveCommandPanels;
     /**
      * Parses the current cleaned PTY screen to extract displayable blocks.
      * - Tool calls (Grep/Glob/ReadFile/Shell/Edit/Write) → command/code/path blocks.
@@ -57,11 +66,16 @@ export declare class QwenRunner extends EventEmitter implements ProviderRunner {
      * Deduplicates via signatures stored on the entry.
      */
     private parseScreenBlocks;
+    private isTuiNoiseLine;
+    private isStandaloneRenderedAssistantLine;
+    private collectRenderedAssistantBlocks;
+    private isMeaningfulRenderedAssistantBlock;
     /**
      * Collect all ✦-prefixed text blocks from screen lines.
      * Each block starts at a ✦ line and continues with indented continuation lines.
      */
     private collectAssistantBlocks;
+    private formatAssistantBlock;
     private stripAnsi;
     private ensureTrace;
     private writeTrace;

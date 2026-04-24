@@ -240,6 +240,7 @@ export class QwenRunner extends EventEmitter {
             lastResolvedApprovalSignature: null,
             lastApprovalResolvedAt: 0,
             requestCounter: 0,
+            commandActive: false,
             ptyTracePath: null,
             ptyTraceStream: null,
             screen: new ScreenBuffer(),
@@ -282,6 +283,7 @@ export class QwenRunner extends EventEmitter {
             lastResolvedApprovalSignature: null,
             lastApprovalResolvedAt: 0,
             requestCounter: 0,
+            commandActive: false,
             ptyTracePath: null,
             ptyTraceStream: null,
             screen: new ScreenBuffer(),
@@ -446,6 +448,7 @@ export class QwenRunner extends EventEmitter {
             clearTimeout(entry.idleCompletionTimer);
             entry.idleCompletionTimer = null;
         }
+        this.setCommandActive(entry, false);
         this.flushPendingAssistantText(entry);
         if (!entry.pty) {
             const duration = Date.now() - entry.startedAt;
@@ -475,6 +478,7 @@ export class QwenRunner extends EventEmitter {
             clearTimeout(entry.idleCompletionTimer);
             entry.idleCompletionTimer = null;
         }
+        this.setCommandActive(entry, false);
         this.flushPendingAssistantText(entry);
         entry.pendingOptions = [];
         entry.pendingRequestId = null;
@@ -607,9 +611,29 @@ export class QwenRunner extends EventEmitter {
             this.parseScreenBlocks(current, clean);
             const parsed = this.parsePrompt(clean);
             if (parsed) {
-                this.raiseApproval(current, parsed.contextText, parsed.options);
-                // Reset screen after approval so next turn starts fresh.
-                current.screen.reset();
+                // Auto-dismiss Qwen's "Do you want to connect VS Code to Qwen Code?"
+                // prompt — always pick option 3 ("No, don't ask again") so the dialog
+                // never interrupts a session again. Option 3 in Qwen's TUI is selected
+                // by moving 2 steps down from the highlighted option 1 and pressing
+                // Enter.
+                if (/connect\s+VS\s*Code\s+to\s+Qwen\s*Code/i.test(parsed.contextText)) {
+                    log.debug(`${ts()} auto-declining VS Code integration prompt`);
+                    if (current.pty) {
+                        current.pty.write("\x1b[B");
+                        current.pty.write("\x1b[B");
+                        current.pty.write("\r");
+                        this.writeTrace(current, "pty-input", {
+                            text: "\\x1b[B x2, \\r",
+                            reason: "auto-decline-vscode-prompt",
+                        });
+                    }
+                    current.screen.reset();
+                }
+                else {
+                    this.raiseApproval(current, parsed.contextText, parsed.options);
+                    // Reset screen after approval so next turn starts fresh.
+                    current.screen.reset();
+                }
             }
             else {
                 const genericApprovalMessage = this.detectGenericApproval(clean);
@@ -636,6 +660,7 @@ export class QwenRunner extends EventEmitter {
                         return;
                     }
                     log.debug(`${ts()} session ${entry.id} - no PTY output for 15s, marking idle`);
+                    this.setCommandActive(latest, false);
                     this.flushPendingAssistantText(latest);
                     latest.status = "idle";
                     latest.pendingOptions = [];
@@ -667,6 +692,7 @@ export class QwenRunner extends EventEmitter {
             current.pendingRequestId = null;
             current.awaitingApproval = false;
             current.lastApprovalSignature = null;
+            this.setCommandActive(current, false);
             if (current.idleCompletionTimer) {
                 clearTimeout(current.idleCompletionTimer);
                 current.idleCompletionTimer = null;
@@ -1359,6 +1385,113 @@ export class QwenRunner extends EventEmitter {
         entry.pendingTextBlocks.clear();
         entry.pendingAssistantText = "";
     }
+    normalizeTextGrowthCandidate(text) {
+        return text.replace(/\s+/g, " ").trim();
+    }
+    commonPrefixLength(left, right) {
+        const limit = Math.min(left.length, right.length);
+        let index = 0;
+        while (index < limit && left[index] === right[index]) {
+            index += 1;
+        }
+        return index;
+    }
+    commonSuffixLength(left, right) {
+        const limit = Math.min(left.length, right.length);
+        let index = 0;
+        while (index < limit &&
+            left[left.length - 1 - index] === right[right.length - 1 - index]) {
+            index += 1;
+        }
+        return index;
+    }
+    sharedLeadingWordCount(left, right) {
+        const leftWords = left.split(/\s+/).filter(Boolean);
+        const rightWords = right.split(/\s+/).filter(Boolean);
+        const limit = Math.min(leftWords.length, rightWords.length);
+        let index = 0;
+        while (index < limit && leftWords[index] === rightWords[index]) {
+            index += 1;
+        }
+        return index;
+    }
+    sharedTrailingWordCount(left, right) {
+        const leftWords = left.split(/\s+/).filter(Boolean);
+        const rightWords = right.split(/\s+/).filter(Boolean);
+        const limit = Math.min(leftWords.length, rightWords.length);
+        let index = 0;
+        while (index < limit &&
+            leftWords[leftWords.length - 1 - index] === rightWords[rightWords.length - 1 - index]) {
+            index += 1;
+        }
+        return index;
+    }
+    findPendingTextBlockKey(entry, text) {
+        const normalized = this.normalizeTextGrowthCandidate(text);
+        if (!normalized) {
+            return null;
+        }
+        for (const [key, pending] of entry.pendingTextBlocks) {
+            const existing = this.normalizeTextGrowthCandidate(pending.text);
+            if (!existing) {
+                continue;
+            }
+            if (normalized.startsWith(existing) || existing.startsWith(normalized)) {
+                return key;
+            }
+            if (this.commonPrefixLength(normalized, existing) >= 24 ||
+                this.sharedLeadingWordCount(normalized, existing) >= 5 ||
+                this.commonSuffixLength(normalized, existing) >= 48 ||
+                this.sharedTrailingWordCount(normalized, existing) >= 6) {
+                return key;
+            }
+        }
+        return null;
+    }
+    hasEmittedEquivalentText(entry, text) {
+        const normalized = this.normalizeTextGrowthCandidate(text);
+        if (!normalized) {
+            return true;
+        }
+        for (const emitted of entry.emittedTextBodies) {
+            const existing = this.normalizeTextGrowthCandidate(emitted);
+            if (!existing) {
+                continue;
+            }
+            if (normalized === existing ||
+                ((normalized.startsWith(existing) || existing.startsWith(normalized)) &&
+                    Math.min(normalized.length, existing.length) >= 24) ||
+                this.sharedLeadingWordCount(normalized, existing) >= 5 ||
+                this.commonSuffixLength(normalized, existing) >= 48 ||
+                this.sharedTrailingWordCount(normalized, existing) >= 6) {
+                return true;
+            }
+        }
+        return false;
+    }
+    setCommandActive(entry, active) {
+        if (entry.commandActive === active) {
+            return;
+        }
+        entry.commandActive = active;
+        this.emitBlock(entry, "command", "Running commands", "Running commands", {
+            active,
+            transient: true,
+            state: active ? "running" : "completed",
+            displayMode: "status-only",
+        });
+    }
+    hasActiveCommandPanels(lines) {
+        return lines.some((line) => {
+            const trimmed = line.trim();
+            if (!trimmed) {
+                return false;
+            }
+            return (/(?:^|[\s\u2502|])[\u22F6\u22F7]\s+Agent\b/.test(trimmed) ||
+                /\u25CF\s+Running\b/.test(trimmed) ||
+                /\+\d+\s+more tool calls\b/i.test(trimmed));
+        });
+    }
     /**
      * Parses the current cleaned PTY screen to extract displayable blocks.
      * - Tool calls (Grep/Glob/ReadFile/Shell/Edit/Write) → command/code/path blocks.
@@ -1368,6 +1501,7 @@ export class QwenRunner extends EventEmitter {
      */
     parseScreenBlocks(entry, clean) {
         const lines = clean.split("\n");
+        this.setCommandActive(entry, this.hasActiveCommandPanels(lines));
         // ── 1. Tool calls ────────────────────────────────────────────────────────
         // Pattern: "│ ✓  ToolName args…" inside boxes.
         // We only emit on completed icons (✓ ✎ ✔ ✗ ✖), not in-progress (⊶ ⧖ ⚡).
@@ -1406,13 +1540,20 @@ export class QwenRunner extends EventEmitter {
         // The screen may show multiple ✦ blocks (chat history). Each is a separate
         // text block. We collect all of them, track the longest capture per prefix
         // key, and emit each once after 3s of stability.
-        const assistantBlocks = this.collectAssistantBlocks(lines, entry);
-        for (const text of assistantBlocks) {
-            if (!text || entry.emittedTextBodies.has(text))
+        const assistantBlocks = [
+            ...this.collectAssistantBlocks(lines, entry).map((text) => ({ text, keyHint: null })),
+            ...this.collectRenderedAssistantBlocks(lines).map((text) => ({
+                text,
+                keyHint: "rendered-screen-block",
+            })),
+        ];
+        for (const { text, keyHint } of assistantBlocks) {
+            if (!text || this.hasEmittedEquivalentText(entry, text))
                 continue;
-            // Use the first 40 chars (normalized) as a stable key for a growing text.
-            const key = text.slice(0, 40);
-            const existing = entry.pendingTextBlocks.get(key);
+            const existingKey = keyHint ?? this.findPendingTextBlockKey(entry, text);
+            const key = existingKey ??
+                `text:${entry.pendingTextBlocks.size}:${this.normalizeTextGrowthCandidate(text).slice(0, 80)}`;
+            const existing = existingKey ? entry.pendingTextBlocks.get(existingKey) : null;
             if (existing) {
                 if (text.length > existing.text.length) {
                     existing.text = text;
@@ -1449,21 +1590,132 @@ export class QwenRunner extends EventEmitter {
                 entry.pendingTextBlocks.set(key, { text, timer });
             }
         }
-        // ── 3. Spinner / thinking label ──────────────────────────────────────────
-        const thinkingMatch = clean.match(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+([A-Za-zÀ-ÿ][^\n(]{2,80}?)(?:\s*\(|\s*\.{2,3}|\n|$)/);
-        if (thinkingMatch) {
-            const label = thinkingMatch[1].trim();
-            if (label &&
-                label !== entry.lastThinkingLabel &&
-                !/waiting for user/i.test(label) &&
-                !/initializing/i.test(label) &&
-                !/dial-up/i.test(label) &&
-                !/snozberr/i.test(label) &&
-                !/microchip/i.test(label)) {
-                entry.lastThinkingLabel = label;
-                this.emitBlock(entry, "thinking", null, label);
+        // Qwen spinner labels stay internal. The mobile client now uses the same
+        // shared transient indicators as Codex/Claude instead of rendering
+        // Qwen's textual thinking output in the conversation transcript.
+    }
+    isTuiNoiseLine(text) {
+        if (!text)
+            return true;
+        const t = text.trim();
+        if (!t)
+            return true;
+        if (/for shortcuts\b/i.test(t))
+            return true;
+        if (/context used\b/i.test(t))
+            return true;
+        if (/Type your message/i.test(t))
+            return true;
+        if (/Press\s+[↑↓]/i.test(t))
+            return true;
+        if (/esc to cancel/i.test(t))
+            return true;
+        if (/Press\s+(?:\u2191|\u2193)/i.test(t))
+            return true;
+        if (/^●\s+Update successful\b/i.test(t))
+            return true;
+        if (/\u25CF\s+Running\b/.test(t))
+            return true;
+        if (/\+\d+\s+more tool calls\b/i.test(t))
+            return true;
+        if (/(?:^|[\s])Agent\s+[A-Z]/.test(t))
+            return true;
+        if (/\.{2,}\s*\(\s*\d+\s*s\b/.test(t))
+            return true;
+        if (/\(\s*\d+\s*s\s*[·•]/.test(t))
+            return true;
+        if (/\b(?:Polishing the algorithms|Resolving dependencies|I'm Feeling Lucky|I'm going the distance|I'm going for speed|Herding (?:the )?cats|Consulting the archives|Feeding the hamsters|Tuning the flux capacitor|Untangling the yarn|Compiling the essence|Finding existential crises|existential crises|Snozberries taste like snozberries|Microchips and salsa|Warming up the dial-up modem|Pre-heating the servers|Charging the laser|Updating the syntax for reality|Almost there|Making it go beep boop|One moment, optimizing humor|Communing with the machine spirit|Garbage collecting|Are you not entertained|Letting the thoughts marinate|Enhancing|It's not a bug, it's a feature)\b/i.test(t)) {
+            return true;
+        }
+        if (/^[\u2800-\u28FF]/.test(t))
+            return true;
+        return false;
+    }
+    isStandaloneRenderedAssistantLine(text) {
+        if (!/^\s{4,}\S/.test(text)) {
+            return false;
+        }
+        const trimmed = text.trim();
+        if (!trimmed || this.isTuiNoiseLine(trimmed)) {
+            return false;
+        }
+        if (/Qwen Code|API Key \||\/model to change|Type your message|Tips: Try \/insight/i.test(trimmed)) {
+            return false;
+        }
+        if (/[▄█]{2,}|██╔|██║|╚████/.test(trimmed)) {
+            return false;
+        }
+        if (/^[╭╮╯╰]/.test(trimmed) ||
+            /^│\s*[✓✎⊶⧖⚡✗✖✔●]/.test(trimmed) ||
+            /^[─━]{5,}$/.test(trimmed)) {
+            return false;
+        }
+        return /^[┌└├│]/.test(trimmed) || /[A-Za-zÀ-ÿ]/.test(trimmed);
+    }
+    collectRenderedAssistantBlocks(lines) {
+        const blocks = [];
+        let i = 0;
+        const belongsToStarBlock = (index) => {
+            for (let j = index - 1; j >= Math.max(0, index - 4); j -= 1) {
+                const previous = lines[j];
+                if (!previous || previous.trim() === "") {
+                    continue;
+                }
+                return /^\s{0,4}✦\s+/.test(previous);
+            }
+            return false;
+        };
+        while (i < lines.length) {
+            const line = lines[i];
+            if (!this.isStandaloneRenderedAssistantLine(line) || belongsToStarBlock(i)) {
+                i += 1;
+                continue;
+            }
+            const collected = [];
+            while (i < lines.length) {
+                const next = lines[i];
+                if (!next) {
+                    break;
+                }
+                if (next.trim() === "") {
+                    if (collected.length > 0 && collected.at(-1) !== "") {
+                        collected.push("");
+                    }
+                    i += 1;
+                    continue;
+                }
+                if (!this.isStandaloneRenderedAssistantLine(next)) {
+                    break;
+                }
+                collected.push(next.replace(/\s+$/g, ""));
+                i += 1;
+            }
+            const text = this.formatAssistantBlock(collected);
+            if (text.length >= 10 &&
+                !this.isTuiNoiseLine(text) &&
+                this.isMeaningfulRenderedAssistantBlock(text)) {
+                blocks.push(text);
             }
         }
+        return blocks;
+    }
+    isMeaningfulRenderedAssistantBlock(text) {
+        const lines = text
+            .split("\n")
+            .map((line) => line.trim())
+            .filter(Boolean);
+        if (lines.length === 0) {
+            return false;
+        }
+        const structuredLines = lines.filter((line) => /^[|┌└├│]/.test(line) || /[┌┐└┘├┤┬┴┼│─]/.test(line));
+        const proseLines = lines.filter((line) => /[A-Za-zÀ-ÿ]/.test(line) &&
+            !/^[|┌└├│]/.test(line) &&
+            !/^\|?\s*[-:]{3,}\s*\|?/.test(line));
+        if (structuredLines.length > 0) {
+            return ((proseLines.length >= 1 && text.length >= 80) ||
+                (structuredLines.length >= 8 && text.length >= 180));
+        }
+        return lines.length >= 2 && text.length >= 40;
     }
     /**
      * Collect all ✦-prefixed text blocks from screen lines.
@@ -1480,17 +1732,23 @@ export class QwenRunner extends EventEmitter {
                     i += 1;
                     while (i < lines.length) {
                         const next = lines[i];
-                        if (!next || next.trim() === "")
+                        if (!next)
                             break;
+                        if (next.trim() === "") {
+                            i += 1;
+                            continue;
+                        }
                         if (/^\s{0,4}✦\s+/.test(next))
                             break;
                         if (/^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(next))
                             break;
                         if (/^[─━]{5,}/.test(next.trim()))
                             break;
-                        if (/^[╭╮╯╰│]/.test(next.trim()))
+                        if (/^[╭╮╯╰]/.test(next.trim()))
                             break;
-                        if (/^[>│]/.test(next.trim()))
+                        if (/^\s*>/.test(next))
+                            break;
+                        if (this.isTuiNoiseLine(next))
                             break;
                         if (/^\s{4}/.test(next)) {
                             i += 1;
@@ -1503,35 +1761,49 @@ export class QwenRunner extends EventEmitter {
                 }
                 const collected = [];
                 const startLine = line.replace(/^\s{0,4}✦\s+/, "").trimEnd();
-                if (startLine)
+                if (startLine && !this.isTuiNoiseLine(startLine))
                     collected.push(startLine);
                 i += 1;
                 // Continuation lines: 4+ space indented, not a new ✦, not a border/spinner.
                 while (i < lines.length) {
                     const next = lines[i];
-                    if (!next || next.trim() === "")
+                    if (!next)
                         break;
+                    if (next.trim() === "") {
+                        if (collected.length > 0 && collected.at(-1) !== "") {
+                            collected.push("");
+                        }
+                        i += 1;
+                        continue;
+                    }
                     if (/^\s{0,4}✦\s+/.test(next))
                         break; // next assistant block
                     if (/^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(next))
                         break; // spinner
                     if (/^[─━]{5,}/.test(next.trim()))
                         break; // separator line
-                    if (/^[╭╮╯╰│]/.test(next.trim()))
-                        break; // box border
-                    if (/^[>│]/.test(next.trim()))
+                    if (/^[╭╮╯╰]/.test(next.trim()))
+                        break; // tool panel border
+                    if (/^\s*>/.test(next))
                         break; // input prompt
+                    if (this.isTuiNoiseLine(next))
+                        break; // Qwen footer / spinner phrase
+                    // Rows padded with huge cursor jumps (e.g. `\u001b[120C…`) render as
+                    // a line with 80+ leading spaces before any real character. Those
+                    // rows never belong to the assistant response.
+                    if (/^\s{40,}\S/.test(next))
+                        break;
                     // Must be indented continuation
                     if (/^\s{4}/.test(next)) {
-                        collected.push(next.replace(/^\s+/, "").trimEnd());
+                        collected.push(next.replace(/\s+$/g, ""));
                         i += 1;
                     }
                     else {
                         break;
                     }
                 }
-                const text = collected.join(" ").replace(/\s{2,}/g, " ").trim();
-                if (text.length >= 10)
+                const text = this.formatAssistantBlock(collected);
+                if (text.length >= 10 && !this.isTuiNoiseLine(text))
                     blocks.push(text);
             }
             else {
@@ -1539,6 +1811,75 @@ export class QwenRunner extends EventEmitter {
             }
         }
         return blocks;
+    }
+    formatAssistantBlock(lines) {
+        const trimmedLines = lines.map((line) => line.replace(/\s+$/g, ""));
+        while (trimmedLines.length > 0 && trimmedLines[0]?.trim() === "") {
+            trimmedLines.shift();
+        }
+        while (trimmedLines.length > 0 && trimmedLines.at(-1)?.trim() === "") {
+            trimmedLines.pop();
+        }
+        if (trimmedLines.length === 0) {
+            return "";
+        }
+        const nonEmptyLines = trimmedLines.filter((line) => line.trim().length > 0);
+        const commonIndent = nonEmptyLines.reduce((smallest, line) => {
+            const indent = line.match(/^\s*/)?.[0]?.length ?? 0;
+            return Math.min(smallest, indent);
+        }, Number.MAX_SAFE_INTEGER);
+        const normalizedLines = trimmedLines.map((line) => line.trim().length > 0 ? line.slice(Math.min(commonIndent, line.length)) : "");
+        const hasStructuredLayout = normalizedLines.some((line) => /[┌┐└┘├┤┬┴┼│─]/.test(line));
+        if (hasStructuredLayout) {
+            return normalizedLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+        }
+        const formatted = [];
+        const isListLine = (line) => /^[-*]\s+/.test(line) || /^\d+[.)]\s+/.test(line);
+        const isHeadingLike = (line) => !isListLine(line) &&
+            line.length <= 72 &&
+            !/[.!?]$/.test(line) &&
+            !/:$/.test(line) &&
+            !/[`*_]/.test(line);
+        const appendToPrevious = (line) => {
+            const previous = formatted.pop() ?? "";
+            formatted.push(`${previous} ${line}`.replace(/\s{2,}/g, " ").trim());
+        };
+        for (const line of normalizedLines) {
+            if (!line.trim()) {
+                if (formatted.at(-1) !== "") {
+                    formatted.push("");
+                }
+                continue;
+            }
+            const previous = formatted.at(-1) ?? "";
+            if (!previous) {
+                formatted.push(line.trim());
+                continue;
+            }
+            const previousIsList = isListLine(previous);
+            const currentIsList = isListLine(line);
+            const currentIsHeading = isHeadingLike(line);
+            if (previousIsList && !currentIsList && !currentIsHeading) {
+                appendToPrevious(line);
+                continue;
+            }
+            if (!previousIsList &&
+                !currentIsList &&
+                !currentIsHeading &&
+                !/[.!?:)]$/.test(previous)) {
+                appendToPrevious(line);
+                continue;
+            }
+            if (currentIsHeading && previous !== "") {
+                if (formatted.at(-1) !== "") {
+                    formatted.push("");
+                }
+                formatted.push(line.trim());
+                continue;
+            }
+            formatted.push(line.trim());
+        }
+        return formatted.join("\n").replace(/\n{3,}/g, "\n\n").trim();
     }
     stripAnsi(value) {
         return value
