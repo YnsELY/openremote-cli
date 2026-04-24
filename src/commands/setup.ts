@@ -4,6 +4,7 @@ import { confirm } from "../lib/prompt.js";
 import { checkCodexCli, checkClaudeCodeCli, checkQwenCli } from "../lib/checks.js";
 import { saveConfig, loadConfig } from "../lib/config.js";
 import type { AppConfig } from "../lib/types.js";
+import { CLI_VERSION } from "../lib/version.js";
 
 const DEFAULT_SUPABASE_URL = "https://wlnvrceomzpouwsluqpk.supabase.co";
 const DEFAULT_SUPABASE_ANON_KEY =
@@ -60,7 +61,7 @@ export async function setupCommand(): Promise<void> {
     userDisplayName: existingConfig?.userDisplayName ?? null,
     createdAt: existingConfig?.createdAt ?? new Date().toISOString(),
     lastSeenAt: new Date().toISOString(),
-    cliVersion: "1.0.0",
+    cliVersion: CLI_VERSION,
     backendUrl: DEFAULT_SUPABASE_URL,
   };
 

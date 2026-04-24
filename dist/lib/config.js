@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { CLI_VERSION } from "./version.js";
 function resolveConfigDir() {
     const home = process.env.HOME ?? process.env.USERPROFILE ?? ".";
     if (process.platform === "win32") {
@@ -24,7 +25,7 @@ function normalizeConfig(raw) {
         userDisplayName: raw.userDisplayName ?? null,
         createdAt: raw.createdAt ?? new Date().toISOString(),
         lastSeenAt: raw.lastSeenAt ?? new Date().toISOString(),
-        cliVersion: raw.cliVersion ?? "1.0.0",
+        cliVersion: CLI_VERSION,
         backendUrl: raw.backendUrl,
     };
 }

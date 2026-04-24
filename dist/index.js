@@ -8,6 +8,7 @@ import { doctorCommand } from "./commands/doctor.js";
 import { logoutCommand } from "./commands/logout.js";
 import { configureLogger } from "./lib/logger.js";
 import { printBanner } from "./lib/banner.js";
+import { CLI_VERSION } from "./lib/version.js";
 // Display OpenRemote banner
 printBanner();
 const program = new Command();
@@ -21,7 +22,7 @@ function withCliContext(action) {
 program
     .name("openremote")
     .description("Control OpenAI Codex from your iPhone")
-    .version("1.0.0")
+    .version(CLI_VERSION)
     .option("--verbose", "Show debug output below the premium UI");
 program
     .command("setup")

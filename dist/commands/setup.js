@@ -3,6 +3,7 @@ import { log } from "../lib/logger.js";
 import { confirm } from "../lib/prompt.js";
 import { checkCodexCli, checkClaudeCodeCli, checkQwenCli } from "../lib/checks.js";
 import { saveConfig, loadConfig } from "../lib/config.js";
+import { CLI_VERSION } from "../lib/version.js";
 const DEFAULT_SUPABASE_URL = "https://wlnvrceomzpouwsluqpk.supabase.co";
 const DEFAULT_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndsbnZyY2VvbXpwb3V3c2x1cXBrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU4NTMwNDcsImV4cCI6MjA5MTQyOTA0N30.WeJWa6UBvnhwfrJEPtty3uNqt1nKjzRvhNQGjGPVsWg";
 export async function setupCommand() {
@@ -44,7 +45,7 @@ export async function setupCommand() {
         userDisplayName: existingConfig?.userDisplayName ?? null,
         createdAt: existingConfig?.createdAt ?? new Date().toISOString(),
         lastSeenAt: new Date().toISOString(),
-        cliVersion: "1.0.0",
+        cliVersion: CLI_VERSION,
         backendUrl: DEFAULT_SUPABASE_URL,
     };
     saveConfig(config);
