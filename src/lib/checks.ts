@@ -1,7 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { configExists, loadConfig } from "./config.js";
 import { hasAuthToken } from "./credentials.js";
-import { getShellLaunch } from "./shell.js";
 import type { AgentProvider } from "./types.js";
 
 export interface CheckResult {
@@ -12,11 +11,11 @@ export interface CheckResult {
 
 function tryExec(cmd: string): string | null {
   try {
-    const shell = getShellLaunch();
-    const result = spawnSync(shell.shell, shell.argsForCommand(cmd), {
+    const result = spawnSync(cmd, {
       encoding: "utf-8",
       windowsHide: true,
       timeout: 10_000,
+      shell: true,
     });
     if (result.status !== 0) {
       return null;
