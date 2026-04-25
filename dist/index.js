@@ -1,11 +1,5 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { setupCommand } from "./commands/setup.js";
-import { loginCommand } from "./commands/login.js";
-import { startCommand } from "./commands/start.js";
-import { statusCommand } from "./commands/status.js";
-import { doctorCommand } from "./commands/doctor.js";
-import { logoutCommand } from "./commands/logout.js";
 import { configureLogger } from "./lib/logger.js";
 import { printBanner } from "./lib/banner.js";
 import { CLI_VERSION } from "./lib/version.js";
@@ -27,26 +21,44 @@ program
 program
     .command("setup")
     .description("Configure OpenRemote: check CLI dependencies and create config")
-    .action(withCliContext(setupCommand));
+    .action(withCliContext(async () => {
+    const { setupCommand } = await import("./commands/setup.js");
+    await setupCommand();
+}));
 program
     .command("login")
     .description("Authenticate via browser and associate this machine to your account")
-    .action(withCliContext(loginCommand));
+    .action(withCliContext(async () => {
+    const { loginCommand } = await import("./commands/login.js");
+    await loginCommand();
+}));
 program
     .command("start")
     .description("Connect to the backend and accept remote Codex sessions")
-    .action(withCliContext(startCommand));
+    .action(withCliContext(async () => {
+    const { startCommand } = await import("./commands/start.js");
+    await startCommand();
+}));
 program
     .command("status")
     .description("Show current configuration, credentials, and readiness")
-    .action(withCliContext(statusCommand));
+    .action(withCliContext(async () => {
+    const { statusCommand } = await import("./commands/status.js");
+    await statusCommand();
+}));
 program
     .command("doctor")
     .description("Run diagnostics on your environment and configuration")
-    .action(withCliContext(doctorCommand));
+    .action(withCliContext(async () => {
+    const { doctorCommand } = await import("./commands/doctor.js");
+    await doctorCommand();
+}));
 program
     .command("logout")
     .description("Remove auth token and optionally the API key")
-    .action(withCliContext(logoutCommand));
+    .action(withCliContext(async () => {
+    const { logoutCommand } = await import("./commands/logout.js");
+    await logoutCommand();
+}));
 program.parse();
 //# sourceMappingURL=index.js.map
