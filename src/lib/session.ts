@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { log } from "./logger.js";
@@ -6,6 +6,7 @@ import { Bridge } from "./bridge.js";
 import { ClaudeRunner } from "./claude-runner.js";
 import { CodexRunner } from "./codex-runner.js";
 import type { ProviderRunner } from "./provider-runner.js";
+import { resolveExistingProjectPath } from "./project-path.js";
 import { QwenRunner } from "./qwen-runner.js";
 import type { AgentProvider, AppConfig, AttachmentRef, InboundMessage, SessionStatus } from "./types.js";
 import type { DashboardState } from "./terminal-ui.js";
@@ -151,21 +152,23 @@ export class SessionManager {
       return;
     }
 
-    // Normalize project path: strip trailing separators (mobile/web inputs
-    // sometimes carry a stray "\" or "/" at the end) and convert "\" to "/"
-    // on POSIX systems (Mac/Linux) so Windows-style paths still resolve.
-    payload.projectPath = payload.projectPath.replace(/[\\/]+$/, "");
-    if (process.platform !== "win32") {
-      payload.projectPath = payload.projectPath.replace(/\\/g, "/");
-    }
+    // Normalize copy/paste artifacts before checking the local filesystem.
+    const projectPath = resolveExistingProjectPath(payload.projectPath);
 
-    if (!existsSync(payload.projectPath)) {
-      log.card("Invalid project path", [payload.projectPath], "danger");
+    if (!projectPath.ok) {
+      // Log the raw bytes to help diagnose invisible characters when the
+      // error keeps reproducing on a path that "looks" correct.
+      const codes = Array.from(projectPath.input).map((c) => c.charCodeAt(0));
+      log.card(
+        "Invalid project path",
+        [projectPath.input, `chars: ${codes.join(",")}`],
+        "danger",
+      );
       this.bridge.send({
         type: "session:error",
         payload: {
           sessionId: payload.sessionId,
-          error: `Project path does not exist: ${payload.projectPath}`,
+          error: `Project path does not exist: ${projectPath.input}`,
         },
       });
       this.bridge.send({
@@ -177,6 +180,11 @@ export class SessionManager {
       });
       return;
     }
+
+    if (projectPath.path !== payload.projectPath.trim()) {
+      log.debug(`Normalized project path: ${payload.projectPath} -> ${projectPath.path}`);
+    }
+    payload.projectPath = projectPath.path;
 
     // Download attachments from Supabase Storage if present
     let localAttachments: string[] | undefined;
@@ -316,6 +324,29 @@ export class SessionManager {
         return;
       }
 
+      const projectPath = resolveExistingProjectPath(payload.projectPath);
+      if (!projectPath.ok) {
+        this.bridge.send({
+          type: "session:error",
+          payload: {
+            sessionId: payload.sessionId,
+            error: `Project path does not exist: ${projectPath.input}`,
+          },
+        });
+        this.bridge.send({
+          type: "session:status",
+          payload: {
+            sessionId: payload.sessionId,
+            status: "failed",
+          },
+        });
+        return;
+      }
+
+      if (projectPath.path !== payload.projectPath.trim()) {
+        log.debug(`Normalized resume project path: ${payload.projectPath} -> ${projectPath.path}`);
+      }
+
       log.step("Resuming the selected session");
       log.setDashboard({
         sessionId: `${payload.sessionId.slice(0, 8)}...`,
@@ -333,7 +364,7 @@ export class SessionManager {
       this.bridge.registerSessionProvider(payload.sessionId, provider);
       runner.resumeSession({
         sessionId: payload.sessionId,
-        projectPath: payload.projectPath,
+        projectPath: projectPath.path,
         prompt: payload.text,
         modelName: payload.modelName ?? (provider === "qwen" ? "qwen-default" : provider === "claude" ? "claude-sonnet-4-6" : "gpt-5.4"),
         reasoningEffort: payload.reasoningEffort ?? "medium",

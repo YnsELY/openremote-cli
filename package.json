@@ -1,6 +1,6 @@
 {
   "name": "openremote",
-  "version": "1.4.2",
+  "version": "1.4.4",
   "description": "OpenRemote CLI — control your AI coding agent (Codex, Qwen, Claude) from your iPhone",
   "type": "module",
   "main": "dist/index.js",
