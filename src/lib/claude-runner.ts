@@ -118,57 +118,113 @@ let _windowsClaudeResolution: { executable: string; prefixArgs: string[] } | nul
  */
 function resolveWindowsClaudeCommand(): { executable: string; prefixArgs: string[] } | null {
   if (_windowsClaudeResolution !== undefined) return _windowsClaudeResolution;
+
+  // Parse a .cmd wrapper to find either a .js script (npm-style) or a .exe (native binary).
+  // Returns { kind: "node", path } for .js or { kind: "exe", path } for .exe.
+  const tryResolveFromCmd = (
+    cmdPath: string,
+  ): { kind: "node" | "exe"; path: string } | null => {
+    try {
+      if (!existsSync(cmdPath)) return null;
+      const cmdContent = readFileSync(cmdPath, "utf-8");
+      const dp0 = path.dirname(cmdPath);
+      const resolveTokens = (p: string): string =>
+        path.resolve(p.replace(/%~dp0%?/gi, dp0 + "\\").replace(/%dp0%/gi, dp0 + "\\"));
+
+      // Prefer .exe (native binary) — Claude Code ships an embedded Node runtime
+      const exeMatches = [...cmdContent.matchAll(/"([^"]+\.exe)"/gi)];
+      for (const m of exeMatches) {
+        const exePath = resolveTokens(m[1]);
+        if (existsSync(exePath)) return { kind: "exe", path: exePath };
+      }
+
+      // Otherwise look for a .js script (older npm-wrapper style)
+      const jsMatches = [...cmdContent.matchAll(/"([^"]+\.js)"/gi)];
+      for (const m of jsMatches) {
+        const scriptPath = resolveTokens(m[1]);
+        if (existsSync(scriptPath) && /cli\.js$/i.test(scriptPath)) {
+          return { kind: "node", path: scriptPath };
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  const candidateScriptPaths: string[] = [];
+  const candidateCmdPaths: string[] = [];
+
   try {
+    // 1) `where claude` — collect ALL hits (.cmd, .ps1, .exe)
     const where = spawnSync("where", ["claude"], { encoding: "utf-8", timeout: 5_000 });
-    if (where.status !== 0 || !where.stdout) {
-      _windowsClaudeResolution = null;
-      return null;
+    if (where.status === 0 && where.stdout) {
+      const paths = where.stdout.trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      for (const p of paths) {
+        if (p.toLowerCase().endsWith(".cmd")) candidateCmdPaths.push(p);
+      }
     }
-
-    // `where` may return multiple hits; prefer the .cmd variant
-    const cmdPath = where.stdout
-      .trim()
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .find((s) => s.toLowerCase().endsWith(".cmd"));
-
-    if (!cmdPath || !existsSync(cmdPath)) {
-      _windowsClaudeResolution = null;
-      return null;
-    }
-
-    const cmdContent = readFileSync(cmdPath, "utf-8");
-    const dp0 = path.dirname(cmdPath);
-
-    // npm .cmd files end with a line like:
-    //   endLocal & …& "%_prog%"  "%dp0%\..\@anthropic-ai\claude-code\cli.js" %*
-    // We extract the quoted JS path that appears just before %*
-    const m = cmdContent.match(/"([^"]+\.js)"\s*%\*/i);
-    if (!m) {
-      _windowsClaudeResolution = null;
-      return null;
-    }
-
-    // Resolve %dp0% / %~dp0% tokens to the directory of the .cmd file
-    const scriptPath = path.resolve(
-      m[1]
-        .replace(/%~dp0%?/gi, dp0 + "\\")
-        .replace(/%dp0%/gi, dp0 + "\\"),
-    );
-
-    if (!existsSync(scriptPath)) {
-      _windowsClaudeResolution = null;
-      return null;
-    }
-
-    log.debug(`[claude-runner] Resolved Windows claude script: ${scriptPath}`);
-    _windowsClaudeResolution = { executable: process.execPath, prefixArgs: [scriptPath] };
-    return _windowsClaudeResolution;
   } catch (err) {
-    log.debug(`[claude-runner] Windows claude resolution failed: ${err}`);
-    _windowsClaudeResolution = null;
-    return null;
+    log.debug(`[claude-runner] 'where claude' failed: ${err}`);
   }
+
+  // 2) Common npm global locations
+  const appData = process.env.APPDATA;
+  const localAppData = process.env.LOCALAPPDATA;
+  const userProfile = process.env.USERPROFILE;
+  const candidates = [
+    appData && path.join(appData, "npm", "claude.cmd"),
+    appData && path.join(appData, "npm", "node_modules", "@anthropic-ai", "claude-code", "cli.js"),
+    userProfile && path.join(userProfile, "AppData", "Roaming", "npm", "claude.cmd"),
+    userProfile && path.join(userProfile, "AppData", "Roaming", "npm", "node_modules", "@anthropic-ai", "claude-code", "cli.js"),
+    localAppData && path.join(localAppData, "npm", "claude.cmd"),
+  ].filter((p): p is string => Boolean(p));
+
+  for (const c of candidates) {
+    if (c.toLowerCase().endsWith(".cmd")) candidateCmdPaths.push(c);
+    else if (c.toLowerCase().endsWith(".js")) candidateScriptPaths.push(c);
+  }
+
+  // 3) `npm root -g` as last resort
+  try {
+    const npmRoot = spawnSync("npm", ["root", "-g"], { encoding: "utf-8", timeout: 5_000, shell: true });
+    if (npmRoot.status === 0 && npmRoot.stdout) {
+      const root = npmRoot.stdout.trim();
+      if (root) {
+        candidateScriptPaths.push(path.join(root, "@anthropic-ai", "claude-code", "cli.js"));
+      }
+    }
+  } catch (err) {
+    log.debug(`[claude-runner] 'npm root -g' failed: ${err}`);
+  }
+
+  // Try parsing .cmd wrappers first — they may point to .exe (native binary, preferred)
+  // or .js (legacy npm wrapper). .exe is the modern Claude Code distribution.
+  for (const cmdPath of candidateCmdPaths) {
+    const resolved = tryResolveFromCmd(cmdPath);
+    if (!resolved) continue;
+    if (resolved.kind === "exe") {
+      log.debug(`[claude-runner] Resolved claude via .cmd → .exe: ${resolved.path}`);
+      _windowsClaudeResolution = { executable: resolved.path, prefixArgs: [] };
+      return _windowsClaudeResolution;
+    }
+    log.debug(`[claude-runner] Resolved claude via .cmd → node script: ${resolved.path}`);
+    _windowsClaudeResolution = { executable: process.execPath, prefixArgs: [resolved.path] };
+    return _windowsClaudeResolution;
+  }
+
+  // Fall back to direct .js script paths
+  for (const scriptPath of candidateScriptPaths) {
+    if (existsSync(scriptPath)) {
+      log.debug(`[claude-runner] Resolved claude via direct script: ${scriptPath}`);
+      _windowsClaudeResolution = { executable: process.execPath, prefixArgs: [scriptPath] };
+      return _windowsClaudeResolution;
+    }
+  }
+
+  log.debug(`[claude-runner] Windows claude resolution failed — falling back to cmd.exe (multiline/UTF-8 prompts may break)`);
+  _windowsClaudeResolution = null;
+  return null;
 }
 
 export class ClaudeRunner extends EventEmitter implements ProviderRunner {

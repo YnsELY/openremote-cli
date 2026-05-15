@@ -151,6 +151,14 @@ export class SessionManager {
       return;
     }
 
+    // Normalize project path: strip trailing separators (mobile/web inputs
+    // sometimes carry a stray "\" or "/" at the end) and convert "\" to "/"
+    // on POSIX systems (Mac/Linux) so Windows-style paths still resolve.
+    payload.projectPath = payload.projectPath.replace(/[\\/]+$/, "");
+    if (process.platform !== "win32") {
+      payload.projectPath = payload.projectPath.replace(/\\/g, "/");
+    }
+
     if (!existsSync(payload.projectPath)) {
       log.card("Invalid project path", [payload.projectPath], "danger");
       this.bridge.send({

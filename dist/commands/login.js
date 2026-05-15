@@ -27,7 +27,7 @@ export async function loginCommand() {
         log.card("Password is required", ["Enter your password and retry."], "danger");
         process.exit(1);
     }
-    log.step("Authenticating with Supabase");
+    log.step("Authenticating");
     const response = await fetch(`${config.supabaseUrl}/functions/v1/auth-login`, {
         method: "POST",
         headers: {

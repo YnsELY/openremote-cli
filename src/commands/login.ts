@@ -33,7 +33,7 @@ export async function loginCommand(): Promise<void> {
     process.exit(1);
   }
 
-  log.step("Authenticating with Supabase");
+  log.step("Authenticating");
 
   const response = await fetch(`${config.supabaseUrl}/functions/v1/auth-login`, {
     method: "POST",
